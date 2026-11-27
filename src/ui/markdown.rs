@@ -301,6 +301,14 @@ fn build_table_widget(
         }
     }
 
+    let scroller = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Automatic)
+        .vscrollbar_policy(gtk::PolicyType::Never)
+        .propagate_natural_height(true)
+        .hexpand(true)
+        .child(&grid)
+        .build();
+
     let frame = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .hexpand(true)
@@ -308,7 +316,7 @@ fn build_table_widget(
         .overflow(gtk::Overflow::Hidden)
         .build();
     frame.add_css_class("markdown-table");
-    frame.append(&grid);
+    frame.append(&scroller);
 
     Some(frame)
 }
@@ -334,8 +342,7 @@ fn build_table_cell(
 
     let label = gtk::Label::builder()
         .use_markup(true)
-        .wrap(true)
-        .wrap_mode(pango::WrapMode::WordChar)
+        .wrap(false)
         .selectable(true)
         .xalign(xalign)
         .hexpand(true)

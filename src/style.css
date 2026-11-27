@@ -77,17 +77,6 @@
     margin-top: 6px;
 }
 
-.markdown-list {
-    margin-start: 4px;
-}
-
-.markdown-quote {
-    border-left: 3px solid var(--accent-bg-color);
-    padding-left: 10px;
-    margin-top: 2px;
-    margin-bottom: 2px;
-}
-
 .markdown-code-block {
     background-color: color-mix(in srgb, currentColor 6%, transparent);
     border-radius: 10px;
@@ -137,7 +126,6 @@
 .markdown-table-header {
     border-top: none;
     background-color: color-mix(in srgb, currentColor 8%, transparent);
-    border-bottom: 1px solid color-mix(in srgb, currentColor 16%, transparent);
 }
 
 .markdown-table-row-alt {
