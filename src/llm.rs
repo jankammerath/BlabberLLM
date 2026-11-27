@@ -57,6 +57,70 @@ pub enum ChatStreamEvent {
     },
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GroundingToolInfo {
+    pub id: String,
+    pub title: String,
+    pub description: String,
+}
+
+pub fn available_grounding_tools_for_kind(kind: ProviderKind) -> Vec<GroundingToolInfo> {
+    match kind {
+        ProviderKind::Claude => vec![
+            GroundingToolInfo {
+                id: "web_search".to_string(),
+                title: "Web Search".to_string(),
+                description: "Search the web for up-to-date information (web_search_20250305)"
+                    .to_string(),
+            },
+            GroundingToolInfo {
+                id: "web_fetch".to_string(),
+                title: "Web Fetch".to_string(),
+                description: "Fetch and read content from URLs (web_fetch_20250910)".to_string(),
+            },
+        ],
+        ProviderKind::Gemini => vec![
+            GroundingToolInfo {
+                id: "google_search".to_string(),
+                title: "Google Search".to_string(),
+                description: "Ground responses with live Google Search results".to_string(),
+            },
+            GroundingToolInfo {
+                id: "url_context".to_string(),
+                title: "URL Context".to_string(),
+                description: "Fetch and reason over web pages referenced in prompts".to_string(),
+            },
+        ],
+        ProviderKind::Grok => vec![GroundingToolInfo {
+            id: "live_search".to_string(),
+            title: "Live Search".to_string(),
+            description: "Ground responses with live web and X search".to_string(),
+        }],
+        ProviderKind::OpenAi => vec![GroundingToolInfo {
+            id: "web_search".to_string(),
+            title: "Web Search".to_string(),
+            description: "Ground responses with OpenAI web search".to_string(),
+        }],
+        ProviderKind::OpenRouter => vec![GroundingToolInfo {
+            id: "web_search".to_string(),
+            title: "Web Search".to_string(),
+            description: "Enable OpenRouter web search grounding plugin".to_string(),
+        }],
+        ProviderKind::Ollama => Vec::new(),
+    }
+}
+
+/// Validates the provider endpoint/API key and returns the grounding tools
+/// available for this provider account.
+pub fn fetch_grounding_tools(account: &ProviderAccount) -> Result<Vec<GroundingToolInfo>, String> {
+    if !account.kind.api_key_optional() && account.api_key.trim().is_empty() {
+        return Err("Enter an API key to load available grounding tools.".to_string());
+    }
+    // Verify the endpoint and API key are valid before reporting available tools.
+    fetch_models(account)?;
+    Ok(available_grounding_tools_for_kind(account.kind))
+}
+
 pub fn fallback_models(kind: ProviderKind) -> &'static [&'static str] {
     match kind {
         ProviderKind::Claude => &[
@@ -890,6 +954,18 @@ where
             if tools_enabled {
                 payload["tools"] = json!([openai_shell_tool_schema(sudo_enabled)]);
             }
+            match account.kind {
+                ProviderKind::OpenAi if account.has_grounding_tool("web_search") => {
+                    payload["web_search_options"] = json!({});
+                }
+                ProviderKind::Grok if account.has_grounding_tool("live_search") => {
+                    payload["search_parameters"] = json!({ "mode": "auto" });
+                }
+                ProviderKind::OpenRouter if account.has_grounding_tool("web_search") => {
+                    payload["plugins"] = json!([{ "id": "web" }]);
+                }
+                _ => {}
+            }
             let mut req = agent
                 .post(&url)
                 .header("Authorization", &format!("Bearer {}", account.api_key.trim()))
@@ -909,8 +985,24 @@ where
                 "stream": true,
                 "messages": conv,
             });
+            let mut claude_tools = Vec::new();
             if tools_enabled {
-                payload["tools"] = json!([claude_shell_tool_schema(sudo_enabled)]);
+                claude_tools.push(claude_shell_tool_schema(sudo_enabled));
+            }
+            if account.has_grounding_tool("web_search") {
+                claude_tools.push(json!({
+                    "type": "web_search_20250305",
+                    "name": "web_search",
+                }));
+            }
+            if account.has_grounding_tool("web_fetch") {
+                claude_tools.push(json!({
+                    "type": "web_fetch_20250910",
+                    "name": "web_fetch",
+                }));
+            }
+            if !claude_tools.is_empty() {
+                payload["tools"] = Value::Array(claude_tools);
             }
             agent
                 .post(&url)
@@ -924,10 +1016,20 @@ where
             let mut payload = json!({
                 "contents": conv,
             });
+            let mut gemini_tools = Vec::new();
             if tools_enabled {
-                payload["tools"] = json!([{
+                gemini_tools.push(json!({
                     "functionDeclarations": [gemini_shell_tool_schema(sudo_enabled)]
-                }]);
+                }));
+            }
+            if account.has_grounding_tool("google_search") {
+                gemini_tools.push(json!({ "google_search": {} }));
+            }
+            if account.has_grounding_tool("url_context") {
+                gemini_tools.push(json!({ "url_context": {} }));
+            }
+            if !gemini_tools.is_empty() {
+                payload["tools"] = Value::Array(gemini_tools);
             }
             agent
                 .post(&url)

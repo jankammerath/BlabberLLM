@@ -1,10 +1,13 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
 
 use adw::prelude::*;
 use gtk::glib;
 
-use crate::llm::{self, ModelOption};
+use crate::llm::{self, GroundingToolInfo, ModelOption};
 use crate::settings::{
     AppSettings, ProviderAccount, ProviderKind, ShellPermissionMode, MAX_MAX_TOOL_STEPS,
     MIN_MAX_TOOL_STEPS,
@@ -620,6 +623,15 @@ fn push_add_provider_page(
         }
     ));
 
+    let enabled_grounding_tools: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+    let grounding_group = build_grounding_tools_section(
+        &kind_row,
+        &endpoint_row,
+        &api_key_row,
+        Rc::clone(&enabled_grounding_tools),
+        Rc::new(|| {}),
+    );
+
     let add_confirm_button = gtk::Button::builder()
         .label("Add Provider")
         .halign(gtk::Align::Center)
@@ -642,6 +654,8 @@ fn push_add_provider_page(
         #[strong]
         settings,
         #[strong]
+        enabled_grounding_tools,
+        #[strong]
         refresh_list,
         #[strong]
         on_changed,
@@ -661,7 +675,8 @@ fn push_add_provider_page(
             };
             let api_key = api_key_row.text().to_string();
 
-            let account = ProviderAccount::new(kind, name, endpoint, api_key);
+            let mut account = ProviderAccount::new(kind, name, endpoint, api_key);
+            account.enabled_grounding_tools = enabled_grounding_tools.borrow().clone();
             {
                 let mut guard = settings.borrow_mut();
                 guard.add_account(account);
@@ -679,6 +694,7 @@ fn push_add_provider_page(
 
     let page_content = adw::PreferencesPage::new();
     page_content.add(&form_group);
+    page_content.add(&grounding_group);
     page_content.add(&action_group);
 
     let header_bar = adw::HeaderBar::new();
@@ -712,6 +728,9 @@ fn push_edit_provider_page(
         &account.api_key,
     );
 
+    let enabled_grounding_tools: Rc<RefCell<Vec<String>>> =
+        Rc::new(RefCell::new(account.enabled_grounding_tools.clone()));
+
     let save_edits: Rc<dyn Fn()> = Rc::new(glib::clone!(
         #[weak]
         kind_row,
@@ -725,6 +744,8 @@ fn push_edit_provider_page(
         settings,
         #[strong]
         account_id,
+        #[strong]
+        enabled_grounding_tools,
         #[strong]
         refresh_list,
         #[strong]
@@ -743,6 +764,7 @@ fn push_edit_provider_page(
                 name,
                 endpoint: endpoint_row.text().trim().to_string(),
                 api_key: api_key_row.text().to_string(),
+                enabled_grounding_tools: enabled_grounding_tools.borrow().clone(),
             };
             {
                 let mut guard = settings.borrow_mut();
@@ -753,6 +775,14 @@ fn push_edit_provider_page(
             on_changed();
         }
     ));
+
+    let grounding_group = build_grounding_tools_section(
+        &kind_row,
+        &endpoint_row,
+        &api_key_row,
+        Rc::clone(&enabled_grounding_tools),
+        Rc::clone(&save_edits),
+    );
 
     kind_row.connect_selected_notify(glib::clone!(
         #[weak]
@@ -815,6 +845,7 @@ fn push_edit_provider_page(
 
     let page_content = adw::PreferencesPage::new();
     page_content.add(&form_group);
+    page_content.add(&grounding_group);
     page_content.add(&danger_group);
 
     let header_bar = adw::HeaderBar::new();
@@ -896,6 +927,248 @@ fn build_provider_form(
     group.add(&api_key_row);
 
     (kind_row, name_row, endpoint_row, api_key_row, group)
+}
+
+fn build_grounding_tools_section(
+    kind_row: &adw::ComboRow,
+    endpoint_row: &adw::EntryRow,
+    api_key_row: &adw::PasswordEntryRow,
+    enabled_tools: Rc<RefCell<Vec<String>>>,
+    on_tools_changed: Rc<dyn Fn()>,
+) -> adw::PreferencesGroup {
+    let list_box = gtk::ListBox::builder()
+        .selection_mode(gtk::SelectionMode::None)
+        .build();
+    list_box.add_css_class("boxed-list");
+
+    let refresh_button = gtk::Button::builder()
+        .icon_name("view-refresh-symbolic")
+        .tooltip_text("Load available grounding tools")
+        .valign(gtk::Align::Center)
+        .build();
+    refresh_button.add_css_class("flat");
+
+    let group = adw::PreferencesGroup::builder()
+        .title("Grounding Tools")
+        .description("Provider-native web search and URL grounding capabilities.")
+        .build();
+    group.set_header_suffix(Some(&refresh_button));
+    group.add(&list_box);
+
+    let load_gen = Rc::new(Cell::new(0u64));
+    let debounce_gen = Rc::new(Cell::new(0u64));
+
+    let load_tools: Rc<dyn Fn()> = Rc::new(glib::clone!(
+        #[weak]
+        kind_row,
+        #[weak]
+        endpoint_row,
+        #[weak]
+        api_key_row,
+        #[weak]
+        list_box,
+        #[weak]
+        refresh_button,
+        #[strong]
+        enabled_tools,
+        #[strong]
+        on_tools_changed,
+        #[strong]
+        load_gen,
+        move || {
+            let gen = load_gen.get().wrapping_add(1);
+            load_gen.set(gen);
+
+            while let Some(child) = list_box.first_child() {
+                list_box.remove(&child);
+            }
+
+            let kind = ProviderKind::from_index(kind_row.selected() as usize);
+            let endpoint = endpoint_row.text().trim().to_string();
+            let api_key = api_key_row.text().to_string();
+
+            if !kind.api_key_optional() && api_key.trim().is_empty() {
+                let prompt_row = adw::ActionRow::builder()
+                    .title("API key required")
+                    .subtitle("Insert an API key above to load available grounding tools.")
+                    .activatable(false)
+                    .build();
+                prompt_row.set_use_markup(false);
+                list_box.append(&prompt_row);
+                refresh_button.set_sensitive(false);
+                return;
+            }
+
+            refresh_button.set_sensitive(false);
+            let spinner = gtk::Spinner::builder()
+                .spinning(true)
+                .valign(gtk::Align::Center)
+                .build();
+            let loading_row = adw::ActionRow::builder()
+                .title("Loading grounding tools…")
+                .subtitle(format!("Checking {} capabilities", kind.display_name()))
+                .activatable(false)
+                .build();
+            loading_row.set_use_markup(false);
+            loading_row.add_suffix(&spinner);
+            list_box.append(&loading_row);
+
+            let probe = ProviderAccount {
+                id: "probe".to_string(),
+                kind,
+                name: kind.display_name().to_string(),
+                endpoint: if endpoint.is_empty() {
+                    kind.default_endpoint().to_string()
+                } else {
+                    endpoint
+                },
+                api_key,
+                enabled_grounding_tools: Vec::new(),
+            };
+
+            let (tx, rx) = mpsc::channel::<Result<Vec<GroundingToolInfo>, String>>();
+            thread::spawn(move || {
+                let _ = tx.send(llm::fetch_grounding_tools(&probe));
+            });
+
+            let load_gen_clone = Rc::clone(&load_gen);
+            let enabled_tools_clone = Rc::clone(&enabled_tools);
+            let on_tools_changed_clone = Rc::clone(&on_tools_changed);
+            glib::timeout_add_local(
+                Duration::from_millis(50),
+                glib::clone!(
+                    #[weak]
+                    list_box,
+                    #[weak]
+                    refresh_button,
+                    #[upgrade_or]
+                    glib::ControlFlow::Break,
+                    move || match rx.try_recv() {
+                        Ok(result) => {
+                            if load_gen_clone.get() != gen {
+                                return glib::ControlFlow::Break;
+                            }
+                            refresh_button.set_sensitive(true);
+                            while let Some(child) = list_box.first_child() {
+                                list_box.remove(&child);
+                            }
+
+                            match result {
+                                Ok(tools) if tools.is_empty() => {
+                                    let empty_row = adw::ActionRow::builder()
+                                        .title("No grounding tools available")
+                                        .subtitle(format!(
+                                            "{} does not expose built-in cloud grounding tools.",
+                                            kind.display_name()
+                                        ))
+                                        .activatable(false)
+                                        .build();
+                                    empty_row.set_use_markup(false);
+                                    list_box.append(&empty_row);
+                                }
+                                Ok(tools) => {
+                                    for tool in tools {
+                                        let is_active = enabled_tools_clone
+                                            .borrow()
+                                            .iter()
+                                            .any(|id| id == &tool.id);
+                                        let switch_row = adw::SwitchRow::builder()
+                                            .title(&tool.title)
+                                            .subtitle(&tool.description)
+                                            .active(is_active)
+                                            .build();
+                                        switch_row.set_use_markup(false);
+
+                                        let tool_id = tool.id.clone();
+                                        switch_row.connect_active_notify({
+                                            let enabled_tools = Rc::clone(&enabled_tools_clone);
+                                            let on_tools_changed =
+                                                Rc::clone(&on_tools_changed_clone);
+                                            move |row| {
+                                                {
+                                                    let mut guard = enabled_tools.borrow_mut();
+                                                    if row.is_active() {
+                                                        if !guard.iter().any(|id| id == &tool_id) {
+                                                            guard.push(tool_id.clone());
+                                                        }
+                                                    } else {
+                                                        guard.retain(|id| id != &tool_id);
+                                                    }
+                                                }
+                                                on_tools_changed();
+                                            }
+                                        });
+
+                                        list_box.append(&switch_row);
+                                    }
+                                }
+                                Err(err) => {
+                                    let err_row = adw::ActionRow::builder()
+                                        .title("Could not load grounding tools")
+                                        .subtitle(&err)
+                                        .activatable(false)
+                                        .build();
+                                    err_row.set_use_markup(false);
+                                    list_box.append(&err_row);
+                                }
+                            }
+                            glib::ControlFlow::Break
+                        }
+                        Err(mpsc::TryRecvError::Empty) => {
+                            if load_gen_clone.get() != gen {
+                                glib::ControlFlow::Break
+                            } else {
+                                glib::ControlFlow::Continue
+                            }
+                        }
+                        Err(mpsc::TryRecvError::Disconnected) => {
+                            if load_gen_clone.get() == gen {
+                                refresh_button.set_sensitive(true);
+                            }
+                            glib::ControlFlow::Break
+                        }
+                    }
+                ),
+            );
+        }
+    ));
+
+    let schedule_load: Rc<dyn Fn()> = Rc::new({
+        let debounce_gen = Rc::clone(&debounce_gen);
+        let load_tools = Rc::clone(&load_tools);
+        move || {
+            let next = debounce_gen.get().wrapping_add(1);
+            debounce_gen.set(next);
+            let debounce_gen_clone = Rc::clone(&debounce_gen);
+            let load_tools_clone = Rc::clone(&load_tools);
+            glib::timeout_add_local_once(Duration::from_millis(650), move || {
+                if debounce_gen_clone.get() == next {
+                    load_tools_clone();
+                }
+            });
+        }
+    });
+
+    refresh_button.connect_clicked({
+        let load_tools = Rc::clone(&load_tools);
+        move |_| load_tools()
+    });
+
+    api_key_row.connect_changed({
+        let schedule_load = Rc::clone(&schedule_load);
+        move |_| schedule_load()
+    });
+    endpoint_row.connect_changed({
+        let schedule_load = Rc::clone(&schedule_load);
+        move |_| schedule_load()
+    });
+    kind_row.connect_selected_notify({
+        let load_tools = Rc::clone(&load_tools);
+        move |_| load_tools()
+    });
+
+    load_tools();
+    group
 }
 
 fn api_key_label(kind: ProviderKind) -> &'static str {

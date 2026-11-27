@@ -89,6 +89,7 @@ pub struct ProviderAccount {
     pub name: String,
     pub endpoint: String,
     pub api_key: String,
+    pub enabled_grounding_tools: Vec<String>,
 }
 
 impl ProviderAccount {
@@ -104,6 +105,22 @@ impl ProviderAccount {
             name,
             endpoint,
             api_key,
+            enabled_grounding_tools: Vec::new(),
+        }
+    }
+
+    pub fn has_grounding_tool(&self, tool_id: &str) -> bool {
+        self.enabled_grounding_tools.iter().any(|t| t == tool_id)
+    }
+
+    #[cfg(test)]
+    pub fn set_grounding_tool(&mut self, tool_id: &str, enabled: bool) {
+        if enabled {
+            if !self.has_grounding_tool(tool_id) {
+                self.enabled_grounding_tools.push(tool_id.to_string());
+            }
+        } else {
+            self.enabled_grounding_tools.retain(|t| t != tool_id);
         }
     }
 
@@ -278,6 +295,16 @@ impl AppSettings {
                         .string(&group, "api_key")
                         .map(|s| s.to_string())
                         .unwrap_or_default();
+                    let enabled_grounding_tools = key_file
+                        .string(&group, "grounding_tools")
+                        .map(|s| {
+                            s.split(',')
+                                .map(str::trim)
+                                .filter(|t| !t.is_empty())
+                                .map(ToString::to_string)
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
 
                     settings.accounts.push(ProviderAccount {
                         id: id_str.to_string(),
@@ -285,6 +312,7 @@ impl AppSettings {
                         name,
                         endpoint,
                         api_key,
+                        enabled_grounding_tools,
                     });
                 }
             }
@@ -350,6 +378,11 @@ impl AppSettings {
             key_file.set_string(&group, "name", &account.name);
             key_file.set_string(&group, "endpoint", &account.endpoint);
             key_file.set_string(&group, "api_key", &account.api_key);
+            key_file.set_string(
+                &group,
+                "grounding_tools",
+                &account.enabled_grounding_tools.join(","),
+            );
         }
 
         let data = key_file.to_data();
@@ -469,12 +502,13 @@ mod tests {
         let path = dir.join("settings.conf");
 
         let mut settings = AppSettings::default();
-        let work_openai = ProviderAccount::new(
+        let mut work_openai = ProviderAccount::new(
             ProviderKind::OpenAi,
             "OpenAI (Work)".into(),
             "https://work.openai.example/v1".into(),
             "sk-work-123".into(),
         );
+        work_openai.set_grounding_tool("web_search", true);
         let personal_openai = ProviderAccount::new(
             ProviderKind::OpenAi,
             "OpenAI (Personal)".into(),
