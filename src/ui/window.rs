@@ -43,6 +43,7 @@ struct ComposerWidgets {
     input_view: gtk::TextView,
     model_dropdown: gtk::DropDown,
     refresh_models_button: gtk::Button,
+    tools_toggle_button: gtk::ToggleButton,
     send_button: gtk::Button,
 }
 
@@ -52,6 +53,7 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
     let active_chat_id: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
     let model_options: Rc<RefCell<Vec<ModelOption>>> = Rc::new(RefCell::new(Vec::new()));
     let suppress_model_selection = Rc::new(Cell::new(false));
+    let suppress_tools_toggle = Rc::new(Cell::new(false));
     let refresh_generation = Rc::new(Cell::new(0u64));
     let active_stream_cancel: Rc<RefCell<Option<Arc<AtomicBool>>>> = Rc::new(RefCell::new(None));
 
@@ -112,10 +114,11 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
     content_stack.add_named(&scrolled_window, Some("chat"));
     content_stack.set_visible_child_name("empty");
 
-    let composer = build_composer();
+    let composer = build_composer(settings.borrow().shell_tool_enabled());
     let input_view = composer.input_view.clone();
     let model_dropdown = composer.model_dropdown.clone();
     let refresh_models_button = composer.refresh_models_button.clone();
+    let tools_toggle_button = composer.tools_toggle_button.clone();
     let send_button = composer.send_button.clone();
 
     let content_toolbar_view = adw::ToolbarView::new();
@@ -410,6 +413,48 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
         move |_| refresh_models()
     });
 
+    let sync_tools_toggle_for_current_context: Rc<dyn Fn()> = Rc::new(glib::clone!(
+        #[weak]
+        tools_toggle_button,
+        #[strong]
+        settings,
+        #[strong]
+        chat_store,
+        #[strong]
+        active_chat_id,
+        #[strong]
+        suppress_tools_toggle,
+        move || {
+            let default_enabled = settings.borrow().shell_tool_enabled();
+            let enabled = active_chat_id
+                .borrow()
+                .as_deref()
+                .and_then(|id| chat_store.borrow().get(id).and_then(|c| c.tool_use_enabled))
+                .unwrap_or(default_enabled);
+
+            suppress_tools_toggle.set(true);
+            tools_toggle_button.set_active(enabled);
+            update_tools_toggle_tooltip(&tools_toggle_button, enabled);
+            suppress_tools_toggle.set(false);
+        }
+    ));
+
+    tools_toggle_button.connect_toggled({
+        let chat_store = Rc::clone(&chat_store);
+        let active_chat_id = Rc::clone(&active_chat_id);
+        let suppress_tools_toggle = Rc::clone(&suppress_tools_toggle);
+        move |btn| {
+            let enabled = btn.is_active();
+            update_tools_toggle_tooltip(btn, enabled);
+            if suppress_tools_toggle.get() {
+                return;
+            }
+            if let Some(chat_id) = active_chat_id.borrow().as_deref() {
+                chat_store.borrow_mut().set_chat_tool_use(chat_id, enabled);
+            }
+        }
+    });
+
     let sidebar_slot: Rc<RefCell<Option<Rc<SidebarView>>>> = Rc::new(RefCell::new(None));
 
     let reset_to_empty_chat: Rc<dyn Fn()> = Rc::new(glib::clone!(
@@ -429,6 +474,8 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
         cancel_active_stream,
         #[strong]
         select_model_for_current_context,
+        #[strong]
+        sync_tools_toggle_for_current_context,
         move || {
             cancel_active_stream();
             *active_chat_id.borrow_mut() = None;
@@ -439,6 +486,7 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
                 sidebar.clear_selection();
             }
             select_model_for_current_context();
+            sync_tools_toggle_for_current_context();
             input_view.grab_focus();
         }
     ));
@@ -464,6 +512,8 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
         cancel_active_stream,
         #[strong]
         select_model_for_current_context,
+        #[strong]
+        sync_tools_toggle_for_current_context,
         move |chat_id: String| {
             cancel_active_stream();
             let store = chat_store.borrow();
@@ -490,6 +540,7 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
             drop(store);
 
             select_model_for_current_context();
+            sync_tools_toggle_for_current_context();
 
             if split_view.is_collapsed() {
                 split_view.set_show_sidebar(false);
@@ -553,6 +604,8 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
         #[weak]
         model_dropdown,
         #[weak]
+        tools_toggle_button,
+        #[weak]
         messages_box,
         #[weak]
         content_stack,
@@ -593,13 +646,14 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
             let Some(option) = selected_option else {
                 return;
             };
+            let session_tools_enabled = tools_toggle_button.is_active();
             let (account, tool_config) = {
                 let guard = settings.borrow();
                 let Some(acc) = guard.get(&option.account_id).cloned() else {
                     return;
                 };
                 let cfg = ShellToolConfig {
-                    enabled: guard.shell_tool_enabled(),
+                    enabled: session_tools_enabled,
                     permission_mode: guard.shell_permission_mode(),
                     sudo_enabled: guard.shell_sudo_enabled(),
                     max_steps: guard.max_tool_steps(),
@@ -614,11 +668,13 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
                 let mut current = active_chat_id.borrow_mut();
                 match current.as_ref() {
                     Some(existing) => {
-                        chat_store.borrow_mut().set_chat_model(
+                        let mut store = chat_store.borrow_mut();
+                        store.set_chat_model(
                             existing,
                             option.account_id.clone(),
                             option.model.clone(),
                         );
+                        store.set_chat_tool_use(existing, session_tools_enabled);
                         existing.clone()
                     }
                     None => {
@@ -626,6 +682,7 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
                             &prompt_owned,
                             Some(option.account_id.clone()),
                             Some(option.model.clone()),
+                            Some(session_tools_enabled),
                         );
                         *current = Some(new_id.clone());
                         new_id
@@ -948,9 +1005,16 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
         #[strong]
         settings,
         #[strong]
+        active_chat_id,
+        #[strong]
         refresh_models,
+        #[strong]
+        sync_tools_toggle_for_current_context,
         move || {
             title.set_subtitle(&providers_subtitle(&settings.borrow()));
+            if active_chat_id.borrow().is_none() {
+                sync_tools_toggle_for_current_context();
+            }
             refresh_models();
         }
     ));
@@ -1098,7 +1162,16 @@ fn clear_box(container: &gtk::Box) {
     }
 }
 
-fn build_composer() -> ComposerWidgets {
+fn update_tools_toggle_tooltip(button: &gtk::ToggleButton, enabled: bool) {
+    let tip = if enabled {
+        "Shell tools enabled for this chat (click to disable)"
+    } else {
+        "Shell tools disabled for this chat (click to enable)"
+    };
+    button.set_tooltip_text(Some(tip));
+}
+
+fn build_composer(initial_tools_enabled: bool) -> ComposerWidgets {
     let input_view = gtk::TextView::builder()
         .wrap_mode(gtk::WrapMode::WordChar)
         .accepts_tab(false)
@@ -1170,6 +1243,16 @@ fn build_composer() -> ComposerWidgets {
     refresh_models_button.add_css_class("flat");
     refresh_models_button.add_css_class("circular");
 
+    let tools_toggle_button = gtk::ToggleButton::builder()
+        .icon_name("utilities-terminal-symbolic")
+        .active(initial_tools_enabled)
+        .valign(gtk::Align::Center)
+        .build();
+    tools_toggle_button.add_css_class("flat");
+    tools_toggle_button.add_css_class("circular");
+    tools_toggle_button.add_css_class("tools-toggle");
+    update_tools_toggle_tooltip(&tools_toggle_button, initial_tools_enabled);
+
     let spacer = gtk::Box::builder().hexpand(true).build();
 
     let send_button = gtk::Button::builder()
@@ -1189,6 +1272,7 @@ fn build_composer() -> ComposerWidgets {
     composer_toolbar.add_css_class("composer-toolbar");
     composer_toolbar.append(&model_dropdown);
     composer_toolbar.append(&refresh_models_button);
+    composer_toolbar.append(&tools_toggle_button);
     composer_toolbar.append(&spacer);
     composer_toolbar.append(&send_button);
 
@@ -1220,6 +1304,7 @@ fn build_composer() -> ComposerWidgets {
         input_view,
         model_dropdown,
         refresh_models_button,
+        tools_toggle_button,
         send_button,
     }
 }

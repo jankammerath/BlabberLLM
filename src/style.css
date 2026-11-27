@@ -41,6 +41,11 @@
     font-size: 0.9em;
 }
 
+.tools-toggle:checked {
+    background-color: color-mix(in srgb, var(--accent-bg-color) 22%, transparent);
+    color: var(--accent-color);
+}
+
 .composer-input,
 .composer-input text {
     background: transparent;

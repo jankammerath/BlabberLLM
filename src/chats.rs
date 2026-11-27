@@ -30,6 +30,7 @@ pub struct ChatSession {
     pub updated_at: i64,
     pub last_account_id: Option<String>,
     pub last_model: Option<String>,
+    pub tool_use_enabled: Option<bool>,
     pub messages: Vec<ChatMessage>,
 }
 
@@ -38,6 +39,7 @@ impl ChatSession {
         first_prompt: &str,
         last_account_id: Option<String>,
         last_model: Option<String>,
+        tool_use_enabled: Option<bool>,
     ) -> Self {
         let now = unix_timestamp_secs();
         let nanos = SystemTime::now()
@@ -50,6 +52,7 @@ impl ChatSession {
             updated_at: now,
             last_account_id,
             last_model,
+            tool_use_enabled,
             messages: Vec::new(),
         }
     }
@@ -111,12 +114,24 @@ impl ChatStore {
         first_prompt: &str,
         account_id: Option<String>,
         model: Option<String>,
+        tool_use_enabled: Option<bool>,
     ) -> String {
-        let chat = ChatSession::new(first_prompt, account_id, model);
+        let chat = ChatSession::new(first_prompt, account_id, model, tool_use_enabled);
         let id = chat.id.clone();
         self.chats.insert(0, chat);
         let _ = self.save_chat(&id);
         id
+    }
+
+    pub fn set_chat_tool_use(&mut self, chat_id: &str, enabled: bool) {
+        let Some(chat) = self.chats.iter_mut().find(|c| c.id == chat_id) else {
+            return;
+        };
+        if chat.tool_use_enabled == Some(enabled) {
+            return;
+        }
+        chat.tool_use_enabled = Some(enabled);
+        let _ = self.save_chat(chat_id);
     }
 
     pub fn set_chat_model(&mut self, chat_id: &str, account_id: String, model: String) {
@@ -193,6 +208,9 @@ impl ChatStore {
         if let Some(model) = &chat.last_model {
             key_file.set_string("chat", "last_model", model);
         }
+        if let Some(enabled) = chat.tool_use_enabled {
+            key_file.set_boolean("chat", "tool_use_enabled", enabled);
+        }
         key_file.set_uint64("chat", "message_count", chat.messages.len() as u64);
 
         for (idx, msg) in chat.messages.iter().enumerate() {
@@ -247,6 +265,7 @@ fn load_chat_file(path: &Path) -> Option<ChatSession> {
         .ok()
         .map(|s| s.to_string())
         .filter(|s| !s.is_empty());
+    let tool_use_enabled = key_file.boolean("chat", "tool_use_enabled").ok();
     let message_count = key_file.uint64("chat", "message_count").unwrap_or(0) as usize;
 
     let mut messages = Vec::with_capacity(message_count);
@@ -313,6 +332,7 @@ fn load_chat_file(path: &Path) -> Option<ChatSession> {
         updated_at,
         last_account_id,
         last_model,
+        tool_use_enabled,
         messages,
     })
 }
@@ -357,6 +377,7 @@ mod tests {
             "Hello\nsecond line",
             Some("provider-1".into()),
             Some("claude-sonnet-4-5".into()),
+            Some(true),
         );
         store.append_message(&id, MessageRole::User, "Hello\nsecond line".into());
         store.append_message_with_tools(
@@ -373,6 +394,7 @@ mod tests {
             Some(4250),
         );
         store.set_chat_model(&id, "provider-2".into(), "gpt-4o".into());
+        store.set_chat_tool_use(&id, false);
 
         let reloaded = ChatStore::load_from_dir(dir.clone());
         assert_eq!(reloaded.chats().len(), 1);
@@ -380,6 +402,7 @@ mod tests {
         assert_eq!(chat.title, "Hello");
         assert_eq!(chat.last_account_id.as_deref(), Some("provider-2"));
         assert_eq!(chat.last_model.as_deref(), Some("gpt-4o"));
+        assert_eq!(chat.tool_use_enabled, Some(false));
         assert_eq!(chat.messages.len(), 2);
         assert_eq!(chat.messages[0].role, MessageRole::User);
         assert_eq!(chat.messages[0].content, "Hello\nsecond line");
