@@ -119,6 +119,8 @@ impl ProviderAccount {
 #[derive(Clone, Debug, Default)]
 pub struct AppSettings {
     accounts: Vec<ProviderAccount>,
+    selected_account_id: Option<String>,
+    selected_model: Option<String>,
 }
 
 impl AppSettings {
@@ -141,6 +143,19 @@ impl AppSettings {
             .is_err()
         {
             return settings;
+        }
+
+        if key_file.has_group("selection") {
+            settings.selected_account_id = key_file
+                .string("selection", "account_id")
+                .ok()
+                .map(|s| s.to_string())
+                .filter(|s| !s.is_empty());
+            settings.selected_model = key_file
+                .string("selection", "model")
+                .ok()
+                .map(|s| s.to_string())
+                .filter(|s| !s.is_empty());
         }
 
         if key_file.has_group("providers") {
@@ -222,6 +237,12 @@ impl AppSettings {
         }
 
         let key_file = glib::KeyFile::new();
+        if let Some(account_id) = &self.selected_account_id {
+            key_file.set_string("selection", "account_id", account_id);
+        }
+        if let Some(model) = &self.selected_model {
+            key_file.set_string("selection", "model", model);
+        }
         let ids: Vec<&str> = self.accounts.iter().map(|a| a.id.as_str()).collect();
         key_file.set_string("providers", "ids", &ids.join(","));
 
@@ -283,6 +304,21 @@ impl AppSettings {
 
     pub fn configured_provider_count(&self) -> usize {
         self.accounts.iter().filter(|a| a.is_configured()).count()
+    }
+
+    pub fn selected_model(&self) -> Option<(&str, &str)> {
+        match (
+            self.selected_account_id.as_deref(),
+            self.selected_model.as_deref(),
+        ) {
+            (Some(account_id), Some(model)) => Some((account_id, model)),
+            _ => None,
+        }
+    }
+
+    pub fn set_selected_model(&mut self, account_id: Option<String>, model: Option<String>) {
+        self.selected_account_id = account_id;
+        self.selected_model = model;
     }
 }
 

@@ -27,8 +27,18 @@
 }
 
 .composer-card {
-    padding: 6px 8px 6px 12px;
+    padding: 8px 10px 8px 12px;
     border-radius: 18px;
+}
+
+.composer-toolbar {
+    margin-top: 2px;
+}
+
+.model-dropdown > button {
+    padding: 4px 10px;
+    min-height: 30px;
+    font-size: 0.9em;
 }
 
 .composer-input,

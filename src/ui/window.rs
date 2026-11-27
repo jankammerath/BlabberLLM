@@ -1,23 +1,45 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
+use std::thread;
+use std::time::Duration;
 
 use adw::prelude::*;
 use gtk::{gdk, gio, glib};
 
 use crate::chats::ChatStore;
-use crate::settings::AppSettings;
+use crate::llm::{self, ModelOption};
+use crate::settings::{AppSettings, ProviderAccount};
 
-use super::message::{build_message_row, MessageRole};
+use super::message::{build_message_row, build_streaming_assistant_row, MessageRole};
 use super::settings_dialog::present_settings_dialog;
 use super::sidebar::SidebarView;
 
 const MAX_CONTENT_WIDTH: i32 = 760;
 const TIGHTENING_THRESHOLD: i32 = 560;
 
+enum StreamChunk {
+    Delta(String),
+    Finished(Result<String, String>),
+}
+
+struct ComposerWidgets {
+    bar: gtk::Box,
+    input_view: gtk::TextView,
+    model_dropdown: gtk::DropDown,
+    refresh_models_button: gtk::Button,
+    send_button: gtk::Button,
+}
+
 pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
     let settings = Rc::new(RefCell::new(AppSettings::load()));
     let chat_store = Rc::new(RefCell::new(ChatStore::load()));
     let active_chat_id: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+    let model_options: Rc<RefCell<Vec<ModelOption>>> = Rc::new(RefCell::new(Vec::new()));
+    let suppress_model_selection = Rc::new(Cell::new(false));
+    let refresh_generation = Rc::new(Cell::new(0u64));
+    let active_stream_cancel: Rc<RefCell<Option<Arc<AtomicBool>>>> = Rc::new(RefCell::new(None));
 
     let title = adw::WindowTitle::new("BlabberLLM", &providers_subtitle(&settings.borrow()));
 
@@ -76,12 +98,16 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
     content_stack.add_named(&scrolled_window, Some("chat"));
     content_stack.set_visible_child_name("empty");
 
-    let (composer_bar, input_view, send_button) = build_composer();
+    let composer = build_composer();
+    let input_view = composer.input_view.clone();
+    let model_dropdown = composer.model_dropdown.clone();
+    let refresh_models_button = composer.refresh_models_button.clone();
+    let send_button = composer.send_button.clone();
 
     let content_toolbar_view = adw::ToolbarView::new();
     content_toolbar_view.add_top_bar(&header_bar);
     content_toolbar_view.set_content(Some(&content_stack));
-    content_toolbar_view.add_bottom_bar(&composer_bar);
+    content_toolbar_view.add_bottom_bar(&composer.bar);
 
     let split_view = adw::OverlaySplitView::builder()
         .sidebar_position(gtk::PackType::Start)
@@ -105,6 +131,245 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
         .flags(glib::BindingFlags::SYNC_CREATE | glib::BindingFlags::INVERT_BOOLEAN)
         .build();
 
+    let update_send_button_state: Rc<dyn Fn()> = Rc::new(glib::clone!(
+        #[weak]
+        input_view,
+        #[weak]
+        send_button,
+        #[strong]
+        model_options,
+        #[strong]
+        active_stream_cancel,
+        move || {
+            let is_streaming = active_stream_cancel.borrow().is_some();
+            if is_streaming {
+                send_button.set_icon_name("media-playback-stop-symbolic");
+                send_button.set_tooltip_text(Some("Stop generating"));
+                send_button.remove_css_class("suggested-action");
+                send_button.add_css_class("destructive-action");
+                send_button.set_sensitive(true);
+            } else {
+                send_button.set_icon_name("go-up-symbolic");
+                send_button.set_tooltip_text(Some("Send message (Enter)"));
+                send_button.remove_css_class("destructive-action");
+                send_button.add_css_class("suggested-action");
+                let buffer = input_view.buffer();
+                let text = buffer.text(&buffer.start_iter(), &buffer.end_iter(), false);
+                let has_text = !text.trim().is_empty();
+                let has_model = !model_options.borrow().is_empty();
+                send_button.set_sensitive(has_text && has_model);
+            }
+        }
+    ));
+
+    let cancel_active_stream: Rc<dyn Fn()> = Rc::new({
+        let active_stream_cancel = Rc::clone(&active_stream_cancel);
+        let update_send_button_state = Rc::clone(&update_send_button_state);
+        move || {
+            if let Some(flag) = active_stream_cancel.borrow_mut().take() {
+                flag.store(true, Ordering::Relaxed);
+            }
+            update_send_button_state();
+        }
+    });
+
+    input_view.buffer().connect_changed({
+        let update_send_button_state = Rc::clone(&update_send_button_state);
+        move |_| update_send_button_state()
+    });
+
+    let apply_model_options: Rc<dyn Fn(Vec<ModelOption>)> = Rc::new(glib::clone!(
+        #[weak]
+        model_dropdown,
+        #[strong]
+        settings,
+        #[strong]
+        model_options,
+        #[strong]
+        suppress_model_selection,
+        #[strong]
+        update_send_button_state,
+        move |options: Vec<ModelOption>| {
+            suppress_model_selection.set(true);
+
+            if options.is_empty() {
+                let placeholder = gtk::StringList::new(&["No models — configure Settings"]);
+                model_dropdown.set_model(Some(&placeholder));
+                model_dropdown.set_selected(0);
+                model_dropdown.set_sensitive(false);
+                *model_options.borrow_mut() = Vec::new();
+                suppress_model_selection.set(false);
+                update_send_button_state();
+                return;
+            }
+
+            let labels: Vec<String> = options.iter().map(ModelOption::display_label).collect();
+            let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+            let list = gtk::StringList::new(&label_refs);
+            model_dropdown.set_model(Some(&list));
+            model_dropdown.set_sensitive(true);
+
+            let selected_idx = {
+                let guard = settings.borrow();
+                guard
+                    .selected_model()
+                    .and_then(|(acc_id, model)| {
+                        options
+                            .iter()
+                            .position(|opt| opt.account_id == acc_id && opt.model == model)
+                    })
+                    .unwrap_or(0)
+            };
+
+            model_dropdown.set_selected(selected_idx as u32);
+
+            if let Some(chosen) = options.get(selected_idx) {
+                let mut guard = settings.borrow_mut();
+                let needs_update = guard.selected_model()
+                    != Some((chosen.account_id.as_str(), chosen.model.as_str()));
+                if needs_update {
+                    guard.set_selected_model(
+                        Some(chosen.account_id.clone()),
+                        Some(chosen.model.clone()),
+                    );
+                    let _ = guard.save();
+                }
+            }
+
+            *model_options.borrow_mut() = options;
+            suppress_model_selection.set(false);
+            update_send_button_state();
+        }
+    ));
+
+    model_dropdown.connect_selected_notify({
+        let settings = Rc::clone(&settings);
+        let model_options = Rc::clone(&model_options);
+        let suppress_model_selection = Rc::clone(&suppress_model_selection);
+        let update_send_button_state = Rc::clone(&update_send_button_state);
+        move |dropdown| {
+            if suppress_model_selection.get() {
+                return;
+            }
+            let idx = dropdown.selected() as usize;
+            if let Some(chosen) = model_options.borrow().get(idx) {
+                let mut guard = settings.borrow_mut();
+                guard.set_selected_model(
+                    Some(chosen.account_id.clone()),
+                    Some(chosen.model.clone()),
+                );
+                let _ = guard.save();
+            }
+            update_send_button_state();
+        }
+    });
+
+    let refresh_models: Rc<dyn Fn()> = Rc::new(glib::clone!(
+        #[weak]
+        refresh_models_button,
+        #[strong]
+        settings,
+        #[strong]
+        refresh_generation,
+        #[strong]
+        apply_model_options,
+        move || {
+            let generation = refresh_generation.get().wrapping_add(1);
+            refresh_generation.set(generation);
+
+            let configured_accounts: Vec<ProviderAccount> = settings
+                .borrow()
+                .accounts()
+                .iter()
+                .filter(|a| a.is_configured())
+                .cloned()
+                .collect();
+
+            if configured_accounts.is_empty() {
+                refresh_models_button.set_sensitive(false);
+                apply_model_options(Vec::new());
+                return;
+            }
+
+            // Populate fallback models immediately so the dropdown is usable right away.
+            let initial_fallbacks = build_fallback_options(&configured_accounts);
+            if !initial_fallbacks.is_empty() {
+                apply_model_options(initial_fallbacks);
+            }
+
+            refresh_models_button.set_sensitive(false);
+            let (tx, rx) = mpsc::channel::<Vec<ModelOption>>();
+
+            thread::spawn(move || {
+                let mut fetched_options = Vec::new();
+                for account in configured_accounts {
+                    match llm::fetch_models(&account) {
+                        Ok(models) if !models.is_empty() => {
+                            for model in models {
+                                fetched_options.push(ModelOption {
+                                    account_id: account.id.clone(),
+                                    account_name: account.name.clone(),
+                                    kind: account.kind,
+                                    model,
+                                });
+                            }
+                        }
+                        _ => {
+                            for &model in llm::fallback_models(account.kind) {
+                                fetched_options.push(ModelOption {
+                                    account_id: account.id.clone(),
+                                    account_name: account.name.clone(),
+                                    kind: account.kind,
+                                    model: model.to_string(),
+                                });
+                            }
+                        }
+                    }
+                }
+                let _ = tx.send(fetched_options);
+            });
+
+            let refresh_generation_clone = Rc::clone(&refresh_generation);
+            let apply_model_options_clone = Rc::clone(&apply_model_options);
+            glib::timeout_add_local(
+                Duration::from_millis(50),
+                glib::clone!(
+                    #[weak]
+                    refresh_models_button,
+                    #[upgrade_or]
+                    glib::ControlFlow::Break,
+                    move || match rx.try_recv() {
+                        Ok(options) => {
+                            if refresh_generation_clone.get() == generation {
+                                apply_model_options_clone(options);
+                                refresh_models_button.set_sensitive(true);
+                            }
+                            glib::ControlFlow::Break
+                        }
+                        Err(mpsc::TryRecvError::Empty) => {
+                            if refresh_generation_clone.get() != generation {
+                                glib::ControlFlow::Break
+                            } else {
+                                glib::ControlFlow::Continue
+                            }
+                        }
+                        Err(mpsc::TryRecvError::Disconnected) => {
+                            if refresh_generation_clone.get() == generation {
+                                refresh_models_button.set_sensitive(true);
+                            }
+                            glib::ControlFlow::Break
+                        }
+                    }
+                ),
+            );
+        }
+    ));
+
+    refresh_models_button.connect_clicked({
+        let refresh_models = Rc::clone(&refresh_models);
+        move |_| refresh_models()
+    });
+
     let sidebar_slot: Rc<RefCell<Option<Rc<SidebarView>>>> = Rc::new(RefCell::new(None));
 
     let reset_to_empty_chat: Rc<dyn Fn()> = Rc::new(glib::clone!(
@@ -120,7 +385,10 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
         active_chat_id,
         #[strong]
         sidebar_slot,
+        #[strong]
+        cancel_active_stream,
         move || {
+            cancel_active_stream();
             *active_chat_id.borrow_mut() = None;
             clear_box(&messages_box);
             content_stack.set_visible_child_name("empty");
@@ -149,7 +417,10 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
         chat_store,
         #[strong]
         active_chat_id,
+        #[strong]
+        cancel_active_stream,
         move |chat_id: String| {
+            cancel_active_stream();
             let store = chat_store.borrow();
             let Some(chat) = store.get(&chat_id) else {
                 return;
@@ -225,6 +496,8 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
         #[weak]
         input_view,
         #[weak]
+        model_dropdown,
+        #[weak]
         messages_box,
         #[weak]
         content_stack,
@@ -233,18 +506,41 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
         #[weak]
         title,
         #[strong]
+        settings,
+        #[strong]
         chat_store,
         #[strong]
         active_chat_id,
         #[strong]
+        model_options,
+        #[strong]
+        active_stream_cancel,
+        #[strong]
+        update_send_button_state,
+        #[strong]
         sidebar,
         move || {
+            if active_stream_cancel.borrow().is_some() {
+                return;
+            }
+
             let buffer = input_view.buffer();
             let raw_text = buffer.text(&buffer.start_iter(), &buffer.end_iter(), false);
             let prompt = raw_text.trim();
             if prompt.is_empty() {
                 return;
             }
+
+            let selected_option = {
+                let idx = model_dropdown.selected() as usize;
+                model_options.borrow().get(idx).cloned()
+            };
+            let Some(option) = selected_option else {
+                return;
+            };
+            let Some(account) = settings.borrow().get(&option.account_id).cloned() else {
+                return;
+            };
 
             let prompt_owned = prompt.to_string();
             buffer.set_text("");
@@ -261,32 +557,165 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
                 }
             };
 
-            let reply = format!(
-                "No LLM backend is connected yet. Once Ollama or a provider API is configured, BlabberLLM will respond to:\n\n“{prompt_owned}”"
-            );
-
-            {
+            let history = {
                 let mut store = chat_store.borrow_mut();
                 store.append_message(&chat_id, MessageRole::User, prompt_owned.clone());
-                store.append_message(&chat_id, MessageRole::Assistant, reply.clone());
                 if let Some(chat) = store.get(&chat_id) {
                     title.set_title(&chat.title);
                 }
                 sidebar.refresh(store.chats(), Some(&chat_id));
-            }
+                store
+                    .get(&chat_id)
+                    .map(|c| c.messages.clone())
+                    .unwrap_or_default()
+            };
 
             content_stack.set_visible_child_name("chat");
             messages_box.append(&build_message_row(MessageRole::User, &prompt_owned));
-            messages_box.append(&build_message_row(MessageRole::Assistant, &reply));
 
+            let assistant_handle = build_streaming_assistant_row(&option.display_label());
+            messages_box.append(&assistant_handle.row);
             scroll_to_bottom(&scrolled_window);
-            input_view.grab_focus();
+
+            let cancel_flag = Arc::new(AtomicBool::new(false));
+            *active_stream_cancel.borrow_mut() = Some(Arc::clone(&cancel_flag));
+            update_send_button_state();
+
+            let (tx, rx) = mpsc::channel::<StreamChunk>();
+            let model_name = option.model.clone();
+            let worker_cancel = Arc::clone(&cancel_flag);
+            thread::spawn(move || {
+                let result = llm::stream_chat(
+                    &account,
+                    &model_name,
+                    &history,
+                    &worker_cancel,
+                    |delta| {
+                        let _ = tx.send(StreamChunk::Delta(delta.to_string()));
+                    },
+                );
+                let _ = tx.send(StreamChunk::Finished(result));
+            });
+
+            let accumulated = Rc::new(RefCell::new(String::new()));
+            let chat_store_clone = Rc::clone(&chat_store);
+            let active_chat_id_clone = Rc::clone(&active_chat_id);
+            let active_stream_cancel_clone = Rc::clone(&active_stream_cancel);
+            let update_send_button_clone = Rc::clone(&update_send_button_state);
+            let sidebar_clone = Rc::clone(&sidebar);
+            let chat_id_for_stream = chat_id.clone();
+
+            glib::timeout_add_local(
+                Duration::from_millis(25),
+                glib::clone!(
+                    #[weak]
+                    scrolled_window,
+                    #[weak]
+                    input_view,
+                    #[upgrade_or]
+                    glib::ControlFlow::Break,
+                    move || {
+                        loop {
+                            match rx.try_recv() {
+                                Ok(StreamChunk::Delta(delta)) => {
+                                    let mut text = accumulated.borrow_mut();
+                                    text.push_str(&delta);
+                                    if active_chat_id_clone.borrow().as_deref()
+                                        == Some(chat_id_for_stream.as_str())
+                                    {
+                                        assistant_handle.set_content(&text);
+                                        scroll_to_bottom(&scrolled_window);
+                                    }
+                                }
+                                Ok(StreamChunk::Finished(result)) => {
+                                    let is_same_stream = active_stream_cancel_clone
+                                        .borrow()
+                                        .as_ref()
+                                        .map(|f| Arc::ptr_eq(f, &cancel_flag))
+                                        .unwrap_or(false);
+                                    if is_same_stream {
+                                        *active_stream_cancel_clone.borrow_mut() = None;
+                                    }
+                                    update_send_button_clone();
+
+                                    let still_viewing = active_chat_id_clone.borrow().as_deref()
+                                        == Some(chat_id_for_stream.as_str());
+
+                                    match result {
+                                        Ok(final_text) => {
+                                            if !final_text.trim().is_empty() {
+                                                let mut store = chat_store_clone.borrow_mut();
+                                                store.append_message(
+                                                    &chat_id_for_stream,
+                                                    MessageRole::Assistant,
+                                                    final_text.clone(),
+                                                );
+                                                let current_active = active_chat_id_clone.borrow();
+                                                sidebar_clone.refresh(
+                                                    store.chats(),
+                                                    current_active.as_deref(),
+                                                );
+                                                if still_viewing {
+                                                    assistant_handle.set_content(&final_text);
+                                                    scroll_to_bottom(&scrolled_window);
+                                                }
+                                            } else if still_viewing {
+                                                if cancel_flag.load(Ordering::Relaxed) {
+                                                    assistant_handle.set_content("Generation stopped.");
+                                                } else {
+                                                    assistant_handle.set_error(
+                                                        "The provider returned an empty response.",
+                                                    );
+                                                }
+                                            }
+                                        }
+                                        Err(err) => {
+                                            if still_viewing {
+                                                assistant_handle.set_error(&err);
+                                                scroll_to_bottom(&scrolled_window);
+                                            }
+                                        }
+                                    }
+
+                                    if still_viewing {
+                                        input_view.grab_focus();
+                                    }
+                                    return glib::ControlFlow::Break;
+                                }
+                                Err(mpsc::TryRecvError::Empty) => {
+                                    return glib::ControlFlow::Continue;
+                                }
+                                Err(mpsc::TryRecvError::Disconnected) => {
+                                    let is_same_stream = active_stream_cancel_clone
+                                        .borrow()
+                                        .as_ref()
+                                        .map(|f| Arc::ptr_eq(f, &cancel_flag))
+                                        .unwrap_or(false);
+                                    if is_same_stream {
+                                        *active_stream_cancel_clone.borrow_mut() = None;
+                                    }
+                                    update_send_button_clone();
+                                    return glib::ControlFlow::Break;
+                                }
+                            }
+                        }
+                    }
+                ),
+            );
         }
     ));
 
     send_button.connect_clicked({
         let submit_message = Rc::clone(&submit_message);
-        move |_| submit_message()
+        let cancel_active_stream = Rc::clone(&cancel_active_stream);
+        let active_stream_cancel = Rc::clone(&active_stream_cancel);
+        move |_| {
+            if active_stream_cancel.borrow().is_some() {
+                cancel_active_stream();
+            } else {
+                submit_message();
+            }
+        }
     });
 
     let key_controller = gtk::EventControllerKey::new();
@@ -304,13 +733,16 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
     });
     input_view.add_controller(key_controller);
 
-    let update_subtitle: Rc<dyn Fn()> = Rc::new(glib::clone!(
+    let on_settings_changed: Rc<dyn Fn()> = Rc::new(glib::clone!(
         #[weak]
         title,
         #[strong]
         settings,
+        #[strong]
+        refresh_models,
         move || {
             title.set_subtitle(&providers_subtitle(&settings.borrow()));
+            refresh_models();
         }
     ));
 
@@ -334,18 +766,34 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
     let preferences_action = gio::ActionEntry::builder("preferences")
         .activate({
             let settings = Rc::clone(&settings);
-            let update_subtitle = Rc::clone(&update_subtitle);
+            let on_settings_changed = Rc::clone(&on_settings_changed);
             move |win: &adw::ApplicationWindow, _, _| {
-                present_settings_dialog(win, Rc::clone(&settings), Rc::clone(&update_subtitle));
+                present_settings_dialog(win, Rc::clone(&settings), Rc::clone(&on_settings_changed));
             }
         })
         .build();
 
     window.add_action_entries([new_chat_action, toggle_sidebar_action, preferences_action]);
 
+    refresh_models();
     input_view.grab_focus();
 
     window
+}
+
+fn build_fallback_options(accounts: &[ProviderAccount]) -> Vec<ModelOption> {
+    let mut options = Vec::new();
+    for account in accounts {
+        for &model in llm::fallback_models(account.kind) {
+            options.push(ModelOption {
+                account_id: account.id.clone(),
+                account_name: account.name.clone(),
+                kind: account.kind,
+                model: model.to_string(),
+            });
+        }
+    }
+    options
 }
 
 fn providers_subtitle(settings: &AppSettings) -> String {
@@ -362,7 +810,7 @@ fn clear_box(container: &gtk::Box) {
     }
 }
 
-fn build_composer() -> (gtk::Box, gtk::TextView, gtk::Button) {
+fn build_composer() -> ComposerWidgets {
     let input_view = gtk::TextView::builder()
         .wrap_mode(gtk::WrapMode::WordChar)
         .accepts_tab(false)
@@ -399,37 +847,72 @@ fn build_composer() -> (gtk::Box, gtk::TextView, gtk::Button) {
         .build();
     input_overlay.add_overlay(&placeholder);
 
+    let buffer = input_view.buffer();
+    buffer.connect_changed(glib::clone!(
+        #[weak]
+        placeholder,
+        move |buf| {
+            let text = buf.text(&buf.start_iter(), &buf.end_iter(), false);
+            placeholder.set_visible(text.is_empty());
+        }
+    ));
+
+    let empty_model = gtk::StringList::new(&["No models — configure Settings"]);
+    let search_expression = gtk::PropertyExpression::new(
+        gtk::StringObject::static_type(),
+        gtk::Expression::NONE,
+        "string",
+    );
+    let model_dropdown = gtk::DropDown::builder()
+        .model(&empty_model)
+        .expression(&search_expression)
+        .enable_search(true)
+        .sensitive(false)
+        .valign(gtk::Align::Center)
+        .build();
+    model_dropdown.add_css_class("flat");
+    model_dropdown.add_css_class("model-dropdown");
+
+    let refresh_models_button = gtk::Button::builder()
+        .icon_name("view-refresh-symbolic")
+        .tooltip_text("Refresh models from configured providers")
+        .valign(gtk::Align::Center)
+        .sensitive(false)
+        .build();
+    refresh_models_button.add_css_class("flat");
+    refresh_models_button.add_css_class("circular");
+
+    let spacer = gtk::Box::builder().hexpand(true).build();
+
     let send_button = gtk::Button::builder()
         .icon_name("go-up-symbolic")
         .tooltip_text("Send message (Enter)")
-        .valign(gtk::Align::End)
+        .valign(gtk::Align::Center)
         .sensitive(false)
         .build();
     send_button.add_css_class("suggested-action");
     send_button.add_css_class("circular");
 
-    let buffer = input_view.buffer();
-    buffer.connect_changed(glib::clone!(
-        #[weak]
-        placeholder,
-        #[weak]
-        send_button,
-        move |buf| {
-            let text = buf.text(&buf.start_iter(), &buf.end_iter(), false);
-            placeholder.set_visible(text.is_empty());
-            send_button.set_sensitive(!text.trim().is_empty());
-        }
-    ));
+    let composer_toolbar = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(6)
+        .hexpand(true)
+        .build();
+    composer_toolbar.add_css_class("composer-toolbar");
+    composer_toolbar.append(&model_dropdown);
+    composer_toolbar.append(&refresh_models_button);
+    composer_toolbar.append(&spacer);
+    composer_toolbar.append(&send_button);
 
     let composer_card = gtk::Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .spacing(8)
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(4)
         .hexpand(true)
         .build();
     composer_card.add_css_class("card");
     composer_card.add_css_class("composer-card");
     composer_card.append(&input_overlay);
-    composer_card.append(&send_button);
+    composer_card.append(&composer_toolbar);
 
     let composer_clamp = adw::Clamp::builder()
         .maximum_size(MAX_CONTENT_WIDTH)
@@ -444,7 +927,13 @@ fn build_composer() -> (gtk::Box, gtk::TextView, gtk::Button) {
     composer_bar.add_css_class("composer-bar");
     composer_bar.append(&composer_clamp);
 
-    (composer_bar, input_view, send_button)
+    ComposerWidgets {
+        bar: composer_bar,
+        input_view,
+        model_dropdown,
+        refresh_models_button,
+        send_button,
+    }
 }
 
 fn scroll_to_bottom(scrolled_window: &gtk::ScrolledWindow) {

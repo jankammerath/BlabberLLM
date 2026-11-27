@@ -1,4 +1,5 @@
 mod chats;
+mod llm;
 mod settings;
 mod ui;
 
