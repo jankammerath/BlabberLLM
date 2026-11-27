@@ -9,7 +9,7 @@ use adw::prelude::*;
 use gtk::{gdk, gio, glib};
 
 use crate::chats::ChatStore;
-use crate::llm::{self, ModelOption};
+use crate::llm::{self, ChatStreamEvent, ModelOption, ShellToolConfig, ShellToolRequest};
 use crate::settings::{AppSettings, ProviderAccount};
 
 use super::message::{build_message_row, build_streaming_assistant_row, MessageRole};
@@ -21,6 +21,20 @@ const TIGHTENING_THRESHOLD: i32 = 560;
 
 enum StreamChunk {
     Delta(String),
+    ToolStarted {
+        command: String,
+        working_directory: Option<String>,
+    },
+    ToolFinished {
+        command: String,
+        exit_code: Option<i32>,
+        output: String,
+        denied: bool,
+    },
+    ApprovalRequest {
+        request: ShellToolRequest,
+        reply_tx: mpsc::Sender<bool>,
+    },
     Finished(Result<String, String>),
 }
 
@@ -494,6 +508,8 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
 
     let submit_message: Rc<dyn Fn()> = Rc::new(glib::clone!(
         #[weak]
+        window,
+        #[weak]
         input_view,
         #[weak]
         model_dropdown,
@@ -538,8 +554,16 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
             let Some(option) = selected_option else {
                 return;
             };
-            let Some(account) = settings.borrow().get(&option.account_id).cloned() else {
-                return;
+            let (account, tool_config) = {
+                let guard = settings.borrow();
+                let Some(acc) = guard.get(&option.account_id).cloned() else {
+                    return;
+                };
+                let cfg = ShellToolConfig {
+                    enabled: guard.shell_tool_enabled(),
+                    permission_mode: guard.shell_permission_mode(),
+                };
+                (acc, cfg)
             };
 
             let prompt_owned = prompt.to_string();
@@ -585,13 +609,60 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
             let model_name = option.model.clone();
             let worker_cancel = Arc::clone(&cancel_flag);
             thread::spawn(move || {
-                let result = llm::stream_chat(
+                let result = llm::stream_chat_with_tools(
                     &account,
                     &model_name,
                     &history,
+                    &tool_config,
                     &worker_cancel,
-                    |delta| {
-                        let _ = tx.send(StreamChunk::Delta(delta.to_string()));
+                    |event| match event {
+                        ChatStreamEvent::Delta(delta) => {
+                            let _ = tx.send(StreamChunk::Delta(delta));
+                        }
+                        ChatStreamEvent::ToolStarted {
+                            command,
+                            working_directory,
+                        } => {
+                            let _ = tx.send(StreamChunk::ToolStarted {
+                                command,
+                                working_directory,
+                            });
+                        }
+                        ChatStreamEvent::ToolFinished {
+                            command,
+                            exit_code,
+                            output,
+                            denied,
+                        } => {
+                            let _ = tx.send(StreamChunk::ToolFinished {
+                                command,
+                                exit_code,
+                                output,
+                                denied,
+                            });
+                        }
+                    },
+                    |request| {
+                        let (reply_tx, reply_rx) = mpsc::channel::<bool>();
+                        if tx
+                            .send(StreamChunk::ApprovalRequest {
+                                request: request.clone(),
+                                reply_tx,
+                            })
+                            .is_err()
+                        {
+                            return false;
+                        }
+                        loop {
+                            if worker_cancel.load(Ordering::Relaxed) {
+                                return false;
+                            }
+                            match reply_rx.recv_timeout(Duration::from_millis(100)) {
+                                Ok(allowed) => return allowed,
+                                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                                Err(mpsc::RecvTimeoutError::Disconnected) => return false,
+                            }
+                        }
                     },
                 );
                 let _ = tx.send(StreamChunk::Finished(result));
@@ -609,23 +680,55 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
                 Duration::from_millis(25),
                 glib::clone!(
                     #[weak]
+                    window,
+                    #[weak]
                     scrolled_window,
                     #[weak]
                     input_view,
                     #[upgrade_or]
                     glib::ControlFlow::Break,
                     move || {
+                        let mut text_changed = false;
                         loop {
                             match rx.try_recv() {
                                 Ok(StreamChunk::Delta(delta)) => {
-                                    let mut text = accumulated.borrow_mut();
-                                    text.push_str(&delta);
+                                    accumulated.borrow_mut().push_str(&delta);
+                                    text_changed = true;
+                                }
+                                Ok(StreamChunk::ToolStarted {
+                                    command,
+                                    working_directory,
+                                }) => {
                                     if active_chat_id_clone.borrow().as_deref()
                                         == Some(chat_id_for_stream.as_str())
                                     {
-                                        assistant_handle.set_content(&text);
+                                        assistant_handle.add_tool_started(
+                                            &command,
+                                            working_directory.as_deref(),
+                                        );
                                         scroll_to_bottom(&scrolled_window);
                                     }
+                                }
+                                Ok(StreamChunk::ToolFinished {
+                                    command,
+                                    exit_code,
+                                    output,
+                                    denied,
+                                }) => {
+                                    if active_chat_id_clone.borrow().as_deref()
+                                        == Some(chat_id_for_stream.as_str())
+                                    {
+                                        assistant_handle.update_tool_finished(
+                                            &command,
+                                            exit_code,
+                                            &output,
+                                            denied,
+                                        );
+                                        scroll_to_bottom(&scrolled_window);
+                                    }
+                                }
+                                Ok(StreamChunk::ApprovalRequest { request, reply_tx }) => {
+                                    present_shell_approval_dialog(&window, &request, reply_tx);
                                 }
                                 Ok(StreamChunk::Finished(result)) => {
                                     let is_same_stream = active_stream_cancel_clone
@@ -661,7 +764,8 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
                                                 }
                                             } else if still_viewing {
                                                 if cancel_flag.load(Ordering::Relaxed) {
-                                                    assistant_handle.set_content("Generation stopped.");
+                                                    assistant_handle
+                                                        .set_plain_status("Generation stopped.");
                                                 } else {
                                                     assistant_handle.set_error(
                                                         "The provider returned an empty response.",
@@ -683,6 +787,13 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
                                     return glib::ControlFlow::Break;
                                 }
                                 Err(mpsc::TryRecvError::Empty) => {
+                                    if text_changed
+                                        && active_chat_id_clone.borrow().as_deref()
+                                            == Some(chat_id_for_stream.as_str())
+                                    {
+                                        assistant_handle.set_content(&accumulated.borrow());
+                                        scroll_to_bottom(&scrolled_window);
+                                    }
                                     return glib::ControlFlow::Continue;
                                 }
                                 Err(mpsc::TryRecvError::Disconnected) => {
@@ -779,6 +890,70 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
     input_view.grab_focus();
 
     window
+}
+
+fn present_shell_approval_dialog(
+    parent: &adw::ApplicationWindow,
+    request: &ShellToolRequest,
+    reply_tx: mpsc::Sender<bool>,
+) {
+    let heading = if request.dangerous {
+        "Allow Potentially Dangerous Command?"
+    } else {
+        "Allow Shell Command?"
+    };
+
+    let mut body = if request.dangerous {
+        "The assistant wants to run a command that may modify files or system state:".to_string()
+    } else {
+        "The assistant wants to run the following shell command:".to_string()
+    };
+    if let Some(dir) = &request.working_directory {
+        body.push_str(&format!("\n\nDirectory: {dir}"));
+    }
+
+    let cmd_label = gtk::Label::builder()
+        .label(&request.command)
+        .wrap(true)
+        .wrap_mode(gtk::pango::WrapMode::WordChar)
+        .selectable(true)
+        .xalign(0.0)
+        .build();
+    cmd_label.add_css_class("monospace");
+    cmd_label.add_css_class("markdown-code-body");
+
+    let cmd_card = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .build();
+    cmd_card.add_css_class("markdown-code-block");
+    cmd_card.append(&cmd_label);
+
+    let dialog = adw::AlertDialog::builder()
+        .heading(heading)
+        .body(&body)
+        .extra_child(&cmd_card)
+        .default_response("deny")
+        .close_response("deny")
+        .build();
+
+    dialog.add_responses(&[("deny", "Deny"), ("allow", "Allow")]);
+    dialog.set_response_appearance(
+        "allow",
+        if request.dangerous {
+            adw::ResponseAppearance::Destructive
+        } else {
+            adw::ResponseAppearance::Suggested
+        },
+    );
+
+    let sender = RefCell::new(Some(reply_tx));
+    dialog.connect_response(None, move |_, response| {
+        if let Some(tx) = sender.borrow_mut().take() {
+            let _ = tx.send(response == "allow");
+        }
+    });
+
+    dialog.present(Some(parent));
 }
 
 fn build_fallback_options(accounts: &[ProviderAccount]) -> Vec<ModelOption> {

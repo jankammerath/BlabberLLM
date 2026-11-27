@@ -1,6 +1,7 @@
 mod chats;
 mod llm;
 mod settings;
+mod tools;
 mod ui;
 
 use adw::prelude::*;

@@ -116,11 +116,63 @@ impl ProviderAccount {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ShellPermissionMode {
+    AlwaysAsk,
+    #[default]
+    AskWhenDangerous,
+    NeverAsk,
+}
+
+impl ShellPermissionMode {
+    pub const ALL: [ShellPermissionMode; 3] = [
+        ShellPermissionMode::AlwaysAsk,
+        ShellPermissionMode::AskWhenDangerous,
+        ShellPermissionMode::NeverAsk,
+    ];
+
+    pub fn key(self) -> &'static str {
+        match self {
+            ShellPermissionMode::AlwaysAsk => "always_ask",
+            ShellPermissionMode::AskWhenDangerous => "ask_when_dangerous",
+            ShellPermissionMode::NeverAsk => "never_ask",
+        }
+    }
+
+    pub fn from_key(key: &str) -> Self {
+        Self::ALL
+            .into_iter()
+            .find(|m| m.key() == key)
+            .unwrap_or(ShellPermissionMode::AskWhenDangerous)
+    }
+
+    pub fn display_name(self) -> &'static str {
+        match self {
+            ShellPermissionMode::AlwaysAsk => "Always ask",
+            ShellPermissionMode::AskWhenDangerous => "Only ask when dangerous",
+            ShellPermissionMode::NeverAsk => "Never ask",
+        }
+    }
+
+    pub fn index(self) -> usize {
+        Self::ALL.iter().position(|&m| m == self).unwrap_or(1)
+    }
+
+    pub fn from_index(idx: usize) -> Self {
+        Self::ALL
+            .get(idx)
+            .copied()
+            .unwrap_or(ShellPermissionMode::AskWhenDangerous)
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct AppSettings {
     accounts: Vec<ProviderAccount>,
     selected_account_id: Option<String>,
     selected_model: Option<String>,
+    shell_tool_enabled: bool,
+    shell_permission_mode: ShellPermissionMode,
 }
 
 impl AppSettings {
@@ -156,6 +208,13 @@ impl AppSettings {
                 .ok()
                 .map(|s| s.to_string())
                 .filter(|s| !s.is_empty());
+        }
+
+        if key_file.has_group("tools") {
+            settings.shell_tool_enabled = key_file.boolean("tools", "shell_enabled").unwrap_or(false);
+            if let Ok(mode) = key_file.string("tools", "shell_permission") {
+                settings.shell_permission_mode = ShellPermissionMode::from_key(mode.as_str());
+            }
         }
 
         if key_file.has_group("providers") {
@@ -243,6 +302,8 @@ impl AppSettings {
         if let Some(model) = &self.selected_model {
             key_file.set_string("selection", "model", model);
         }
+        key_file.set_boolean("tools", "shell_enabled", self.shell_tool_enabled);
+        key_file.set_string("tools", "shell_permission", self.shell_permission_mode.key());
         let ids: Vec<&str> = self.accounts.iter().map(|a| a.id.as_str()).collect();
         key_file.set_string("providers", "ids", &ids.join(","));
 
@@ -319,6 +380,22 @@ impl AppSettings {
     pub fn set_selected_model(&mut self, account_id: Option<String>, model: Option<String>) {
         self.selected_account_id = account_id;
         self.selected_model = model;
+    }
+
+    pub fn shell_tool_enabled(&self) -> bool {
+        self.shell_tool_enabled
+    }
+
+    pub fn set_shell_tool_enabled(&mut self, enabled: bool) {
+        self.shell_tool_enabled = enabled;
+    }
+
+    pub fn shell_permission_mode(&self) -> ShellPermissionMode {
+        self.shell_permission_mode
+    }
+
+    pub fn set_shell_permission_mode(&mut self, mode: ShellPermissionMode) {
+        self.shell_permission_mode = mode;
     }
 }
 

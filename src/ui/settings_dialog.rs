@@ -4,7 +4,7 @@ use std::rc::Rc;
 use adw::prelude::*;
 use gtk::glib;
 
-use crate::settings::{AppSettings, ProviderAccount, ProviderKind};
+use crate::settings::{AppSettings, ProviderAccount, ProviderKind, ShellPermissionMode};
 
 pub fn present_settings_dialog(
     parent: &adw::ApplicationWindow,
@@ -43,6 +43,64 @@ pub fn present_settings_dialog(
     providers_group.set_header_suffix(Some(&add_button));
 
     providers_page.add(&providers_group);
+
+    let tools_group = adw::PreferencesGroup::builder()
+        .title("Tools")
+        .description("Allow the assistant to run local shell commands when answering prompts.")
+        .build();
+
+    let shell_enabled = settings.borrow().shell_tool_enabled();
+    let shell_switch = adw::SwitchRow::builder()
+        .title("Shell Tool")
+        .subtitle("Enable bash command execution for the assistant")
+        .active(shell_enabled)
+        .build();
+
+    let permission_labels: Vec<&str> = ShellPermissionMode::ALL
+        .iter()
+        .map(|m| m.display_name())
+        .collect();
+    let permission_model = gtk::StringList::new(&permission_labels);
+    let permission_row = adw::ComboRow::builder()
+        .title("Tool Use Permission")
+        .subtitle("Choose when to ask before running a shell command")
+        .model(&permission_model)
+        .selected(settings.borrow().shell_permission_mode().index() as u32)
+        .sensitive(shell_enabled)
+        .build();
+
+    shell_switch
+        .bind_property("active", &permission_row, "sensitive")
+        .sync_create()
+        .build();
+
+    shell_switch.connect_active_notify({
+        let settings = Rc::clone(&settings);
+        let on_changed = Rc::clone(&on_changed);
+        move |row| {
+            {
+                let mut guard = settings.borrow_mut();
+                guard.set_shell_tool_enabled(row.is_active());
+                let _ = guard.save();
+            }
+            on_changed();
+        }
+    });
+
+    permission_row.connect_selected_notify({
+        let settings = Rc::clone(&settings);
+        move |row| {
+            let mode = ShellPermissionMode::from_index(row.selected() as usize);
+            let mut guard = settings.borrow_mut();
+            guard.set_shell_permission_mode(mode);
+            let _ = guard.save();
+        }
+    });
+
+    tools_group.add(&shell_switch);
+    tools_group.add(&permission_row);
+    providers_page.add(&tools_group);
+
     dialog.add(&providers_page);
 
     let refresh_slot: Rc<RefCell<Option<Rc<dyn Fn()>>>> = Rc::new(RefCell::new(None));
