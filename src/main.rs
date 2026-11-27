@@ -16,6 +16,8 @@ fn main() -> glib::ExitCode {
 
     app.connect_startup(|app| {
         load_css();
+        setup_icon_theme();
+        gtk::Window::set_default_icon_name(APP_ID);
         setup_app_actions(app);
     });
 
@@ -42,6 +44,16 @@ fn load_css() {
             &provider,
             gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
         );
+    }
+}
+
+fn setup_icon_theme() {
+    if let Some(display) = gdk::Display::default() {
+        let theme = gtk::IconTheme::for_display(&display);
+        let dev_icons = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("packaging/icons");
+        if dev_icons.is_dir() {
+            theme.add_search_path(&dev_icons);
+        }
     }
 }
 

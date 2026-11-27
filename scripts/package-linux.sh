@@ -34,6 +34,7 @@ if [[ ! -x "$BINARY" ]]; then
 fi
 
 DESKTOP_FILE="$REPO_ROOT/packaging/org.blabberllm.BlabberLLM.desktop"
+ICONS_DIR="$REPO_ROOT/packaging/icons/hicolor"
 LICENSE_FILE="$REPO_ROOT/LICENSE"
 
 WORK_DIR="$(mktemp -d)"
@@ -49,6 +50,12 @@ mkdir -p \
 
 install -m 0755 "$BINARY" "$DEB_STAGE/usr/bin/blabber-llm"
 install -m 0644 "$DESKTOP_FILE" "$DEB_STAGE/usr/share/applications/org.blabberllm.BlabberLLM.desktop"
+for size in 48x48 64x64 128x128 256x256 512x512; do
+    mkdir -p "$DEB_STAGE/usr/share/icons/hicolor/${size}/apps"
+    install -m 0644 \
+        "$ICONS_DIR/${size}/apps/org.blabberllm.BlabberLLM.png" \
+        "$DEB_STAGE/usr/share/icons/hicolor/${size}/apps/org.blabberllm.BlabberLLM.png"
+done
 if [[ -f "$LICENSE_FILE" ]]; then
     install -m 0644 "$LICENSE_FILE" "$DEB_STAGE/usr/share/doc/blabber-llm/copyright"
 fi
@@ -105,6 +112,10 @@ mkdir -p %{buildroot}/usr/share/applications
 mkdir -p %{buildroot}/usr/share/licenses/blabber-llm
 install -m 0755 ${BINARY} %{buildroot}/usr/bin/blabber-llm
 install -m 0644 ${DESKTOP_FILE} %{buildroot}/usr/share/applications/org.blabberllm.BlabberLLM.desktop
+for size in 48x48 64x64 128x128 256x256 512x512; do
+    mkdir -p %{buildroot}/usr/share/icons/hicolor/\${size}/apps
+    install -m 0644 ${ICONS_DIR}/\${size}/apps/org.blabberllm.BlabberLLM.png %{buildroot}/usr/share/icons/hicolor/\${size}/apps/org.blabberllm.BlabberLLM.png
+done
 if [ -f "${LICENSE_FILE}" ]; then
     install -m 0644 ${LICENSE_FILE} %{buildroot}/usr/share/licenses/blabber-llm/LICENSE
 fi
@@ -112,6 +123,7 @@ fi
 %files
 /usr/bin/blabber-llm
 /usr/share/applications/org.blabberllm.BlabberLLM.desktop
+/usr/share/icons/hicolor/*/apps/org.blabberllm.BlabberLLM.png
 %license /usr/share/licenses/blabber-llm/LICENSE
 EOF
 

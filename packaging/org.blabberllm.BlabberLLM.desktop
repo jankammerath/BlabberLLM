@@ -2,7 +2,7 @@
 Name=BlabberLLM
 Comment=Native GTK4 & Libadwaita LLM chat GUI for GNOME
 Exec=blabber-llm
-Icon=chat-message-new-symbolic
+Icon=org.blabberllm.BlabberLLM
 Terminal=false
 Type=Application
 Categories=Network;Chat;Utility;GTK;

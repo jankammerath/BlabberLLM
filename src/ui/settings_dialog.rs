@@ -370,6 +370,17 @@ pub fn present_settings_dialog(
         .subtitle("Native GTK4 & Libadwaita LLM chat client")
         .activatable(false)
         .build();
+    let icon_bytes = glib::Bytes::from_static(include_bytes!(
+        "../../packaging/icons/hicolor/128x128/apps/org.blabberllm.BlabberLLM.png"
+    ));
+    if let Ok(texture) = gtk::gdk::Texture::from_bytes(&icon_bytes) {
+        let icon_img = gtk::Image::builder()
+            .paintable(&texture)
+            .pixel_size(32)
+            .valign(gtk::Align::Center)
+            .build();
+        about_row.add_prefix(&icon_img);
+    }
     about_row.add_suffix(&version_label);
 
     about_group.add(&about_row);
