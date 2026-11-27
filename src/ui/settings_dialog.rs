@@ -353,6 +353,28 @@ pub fn present_settings_dialog(
     tools_group.add(&sudo_switch);
     providers_page.add(&tools_group);
 
+    let about_group = adw::PreferencesGroup::builder()
+        .title("About")
+        .build();
+
+    let version_label = gtk::Label::builder()
+        .label(format!("v{}", env!("CARGO_PKG_VERSION")))
+        .valign(gtk::Align::Center)
+        .selectable(true)
+        .build();
+    version_label.add_css_class("dim-label");
+    version_label.add_css_class("monospace");
+
+    let about_row = adw::ActionRow::builder()
+        .title("BlabberLLM")
+        .subtitle("Native GTK4 & Libadwaita LLM chat client")
+        .activatable(false)
+        .build();
+    about_row.add_suffix(&version_label);
+
+    about_group.add(&about_row);
+    providers_page.add(&about_group);
+
     dialog.add(&providers_page);
 
     let refresh_slot: Rc<RefCell<Option<Rc<dyn Fn()>>>> = Rc::new(RefCell::new(None));

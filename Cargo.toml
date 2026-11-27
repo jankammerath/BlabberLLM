@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.85"
 description = "An open GTK4 LLM chat GUI for GNOME following Adwaita design"
+license = "GPL-3.0-only"
+repository = "https://github.com/jankammerath/BlabberLLM"
 
 [dependencies]
 adw = { package = "libadwaita", version = "0.8", features = ["v1_6"] }
