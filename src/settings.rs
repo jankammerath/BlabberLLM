@@ -166,7 +166,11 @@ impl ShellPermissionMode {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+pub const DEFAULT_MAX_TOOL_STEPS: usize = 10;
+pub const MIN_MAX_TOOL_STEPS: usize = 1;
+pub const MAX_MAX_TOOL_STEPS: usize = 100;
+
+#[derive(Clone, Debug)]
 pub struct AppSettings {
     accounts: Vec<ProviderAccount>,
     default_account_id: Option<String>,
@@ -174,6 +178,21 @@ pub struct AppSettings {
     shell_tool_enabled: bool,
     shell_permission_mode: ShellPermissionMode,
     shell_sudo_enabled: bool,
+    max_tool_steps: usize,
+}
+
+impl Default for AppSettings {
+    fn default() -> Self {
+        Self {
+            accounts: Vec::new(),
+            default_account_id: None,
+            default_model: None,
+            shell_tool_enabled: false,
+            shell_permission_mode: ShellPermissionMode::default(),
+            shell_sudo_enabled: false,
+            max_tool_steps: DEFAULT_MAX_TOOL_STEPS,
+        }
+    }
 }
 
 impl AppSettings {
@@ -228,6 +247,9 @@ impl AppSettings {
                 settings.shell_permission_mode = ShellPermissionMode::from_key(mode.as_str());
             }
             settings.shell_sudo_enabled = key_file.boolean("tools", "sudo_enabled").unwrap_or(false);
+            if let Ok(steps) = key_file.integer("tools", "max_steps") {
+                settings.set_max_tool_steps(steps.max(1) as usize);
+            }
         }
 
         if key_file.has_group("providers") {
@@ -318,6 +340,7 @@ impl AppSettings {
         key_file.set_boolean("tools", "shell_enabled", self.shell_tool_enabled);
         key_file.set_string("tools", "shell_permission", self.shell_permission_mode.key());
         key_file.set_boolean("tools", "sudo_enabled", self.shell_sudo_enabled);
+        key_file.set_integer("tools", "max_steps", self.max_tool_steps as i32);
         let ids: Vec<&str> = self.accounts.iter().map(|a| a.id.as_str()).collect();
         key_file.set_string("providers", "ids", &ids.join(","));
 
@@ -422,6 +445,14 @@ impl AppSettings {
 
     pub fn set_shell_sudo_enabled(&mut self, enabled: bool) {
         self.shell_sudo_enabled = enabled;
+    }
+
+    pub fn max_tool_steps(&self) -> usize {
+        self.max_tool_steps
+    }
+
+    pub fn set_max_tool_steps(&mut self, steps: usize) {
+        self.max_tool_steps = steps.clamp(MIN_MAX_TOOL_STEPS, MAX_MAX_TOOL_STEPS);
     }
 }
 

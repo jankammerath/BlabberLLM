@@ -602,6 +602,7 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
                     enabled: guard.shell_tool_enabled(),
                     permission_mode: guard.shell_permission_mode(),
                     sudo_enabled: guard.shell_sudo_enabled(),
+                    max_steps: guard.max_tool_steps(),
                 };
                 (acc, cfg)
             };

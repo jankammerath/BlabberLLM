@@ -5,7 +5,10 @@ use adw::prelude::*;
 use gtk::glib;
 
 use crate::llm::{self, ModelOption};
-use crate::settings::{AppSettings, ProviderAccount, ProviderKind, ShellPermissionMode};
+use crate::settings::{
+    AppSettings, ProviderAccount, ProviderKind, ShellPermissionMode, MAX_MAX_TOOL_STEPS,
+    MIN_MAX_TOOL_STEPS,
+};
 
 pub fn present_settings_dialog(
     parent: &adw::ApplicationWindow,
@@ -13,15 +16,41 @@ pub fn present_settings_dialog(
     model_options: Rc<RefCell<Vec<ModelOption>>>,
     on_changed: Rc<dyn Fn()>,
 ) {
-    let dialog = adw::PreferencesDialog::builder()
+    let parent_height = parent.height().max(parent.default_height()).max(500);
+    let target_height = ((parent_height as f64) * 0.8).round() as i32;
+
+    let nav_view = adw::NavigationView::new();
+
+    let window = adw::Window::builder()
         .title("Settings")
-        .content_width(600)
-        .content_height(520)
-        .search_enabled(false)
+        .transient_for(parent)
+        .modal(true)
+        .resizable(true)
+        .default_width(620)
+        .default_height(target_height)
+        .width_request(360)
+        .height_request(400)
+        .content(&nav_view)
         .build();
 
+    let key_controller = gtk::EventControllerKey::new();
+    key_controller.connect_key_pressed(glib::clone!(
+        #[weak]
+        window,
+        #[upgrade_or]
+        glib::Propagation::Proceed,
+        move |_, key, _, _| {
+            if key == gtk::gdk::Key::Escape {
+                window.close();
+                return glib::Propagation::Stop;
+            }
+            glib::Propagation::Proceed
+        }
+    ));
+    window.add_controller(key_controller);
+
     let providers_page = adw::PreferencesPage::builder()
-        .title("Providers")
+        .title("Settings")
         .icon_name("network-server-symbolic")
         .build();
 
@@ -306,6 +335,23 @@ pub fn present_settings_dialog(
         .sensitive(shell_enabled)
         .build();
 
+    let max_steps_adj = gtk::Adjustment::new(
+        settings.borrow().max_tool_steps() as f64,
+        MIN_MAX_TOOL_STEPS as f64,
+        MAX_MAX_TOOL_STEPS as f64,
+        1.0,
+        5.0,
+        0.0,
+    );
+    let max_steps_row = adw::SpinRow::builder()
+        .title("Maximum Agent Steps")
+        .subtitle("Maximum number of tool-use turns per prompt")
+        .adjustment(&max_steps_adj)
+        .numeric(true)
+        .digits(0)
+        .sensitive(shell_enabled)
+        .build();
+
     shell_switch
         .bind_property("active", &permission_row, "sensitive")
         .sync_create()
@@ -313,6 +359,11 @@ pub fn present_settings_dialog(
 
     shell_switch
         .bind_property("active", &sudo_switch, "sensitive")
+        .sync_create()
+        .build();
+
+    shell_switch
+        .bind_property("active", &max_steps_row, "sensitive")
         .sync_create()
         .build();
 
@@ -348,9 +399,20 @@ pub fn present_settings_dialog(
         }
     });
 
+    max_steps_row.connect_value_notify({
+        let settings = Rc::clone(&settings);
+        move |row| {
+            let steps = row.value().round().max(1.0) as usize;
+            let mut guard = settings.borrow_mut();
+            guard.set_max_tool_steps(steps);
+            let _ = guard.save();
+        }
+    });
+
     tools_group.add(&shell_switch);
     tools_group.add(&permission_row);
     tools_group.add(&sudo_switch);
+    tools_group.add(&max_steps_row);
     providers_page.add(&tools_group);
 
     let about_group = adw::PreferencesGroup::builder()
@@ -386,13 +448,22 @@ pub fn present_settings_dialog(
     about_group.add(&about_row);
     providers_page.add(&about_group);
 
-    dialog.add(&providers_page);
+    let main_header = adw::HeaderBar::new();
+    let main_toolbar = adw::ToolbarView::new();
+    main_toolbar.add_top_bar(&main_header);
+    main_toolbar.set_content(Some(&providers_page));
+
+    let root_page = adw::NavigationPage::builder()
+        .title("Settings")
+        .child(&main_toolbar)
+        .build();
+    nav_view.add(&root_page);
 
     let refresh_slot: Rc<RefCell<Option<Rc<dyn Fn()>>>> = Rc::new(RefCell::new(None));
 
     let refresh_list: Rc<dyn Fn()> = Rc::new(glib::clone!(
         #[weak]
-        dialog,
+        nav_view,
         #[weak]
         list_box,
         #[strong]
@@ -444,7 +515,7 @@ pub fn present_settings_dialog(
                 let account_id = account.id.clone();
                 row.connect_activated(glib::clone!(
                     #[weak]
-                    dialog,
+                    nav_view,
                     #[strong]
                     settings,
                     #[strong]
@@ -454,7 +525,7 @@ pub fn present_settings_dialog(
                     move |_| {
                         if let Some(refresh) = refresh_slot.borrow().as_ref() {
                             push_edit_provider_page(
-                                &dialog,
+                                &nav_view,
                                 Rc::clone(&settings),
                                 account_id.clone(),
                                 Rc::clone(refresh),
@@ -474,7 +545,7 @@ pub fn present_settings_dialog(
 
     add_button.connect_clicked(glib::clone!(
         #[weak]
-        dialog,
+        nav_view,
         #[strong]
         settings,
         #[strong]
@@ -483,7 +554,7 @@ pub fn present_settings_dialog(
         on_changed,
         move |_| {
             push_add_provider_page(
-                &dialog,
+                &nav_view,
                 Rc::clone(&settings),
                 Rc::clone(&refresh_list),
                 Rc::clone(&on_changed),
@@ -491,11 +562,11 @@ pub fn present_settings_dialog(
         }
     ));
 
-    dialog.present(Some(parent));
+    window.present();
 }
 
 fn push_add_provider_page(
-    dialog: &adw::PreferencesDialog,
+    nav_view: &adw::NavigationView,
     settings: Rc<RefCell<AppSettings>>,
     refresh_list: Rc<dyn Fn()>,
     on_changed: Rc<dyn Fn()>,
@@ -559,7 +630,7 @@ fn push_add_provider_page(
 
     add_confirm_button.connect_clicked(glib::clone!(
         #[weak]
-        dialog,
+        nav_view,
         #[weak]
         kind_row,
         #[weak]
@@ -599,7 +670,7 @@ fn push_add_provider_page(
 
             refresh_list();
             on_changed();
-            dialog.pop_subpage();
+            nav_view.pop();
         }
     ));
 
@@ -620,11 +691,11 @@ fn push_add_provider_page(
         .child(&toolbar_view)
         .build();
 
-    dialog.push_subpage(&nav_page);
+    nav_view.push(&nav_page);
 }
 
 fn push_edit_provider_page(
-    dialog: &adw::PreferencesDialog,
+    nav_view: &adw::NavigationView,
     settings: Rc<RefCell<AppSettings>>,
     account_id: String,
     refresh_list: Rc<dyn Fn()>,
@@ -718,7 +789,7 @@ fn push_edit_provider_page(
 
     remove_button.connect_clicked(glib::clone!(
         #[weak]
-        dialog,
+        nav_view,
         #[strong]
         settings,
         #[strong]
@@ -735,7 +806,7 @@ fn push_edit_provider_page(
             }
             refresh_list();
             on_changed();
-            dialog.pop_subpage();
+            nav_view.pop();
         }
     ));
 
@@ -756,7 +827,7 @@ fn push_edit_provider_page(
         .child(&toolbar_view)
         .build();
 
-    dialog.push_subpage(&nav_page);
+    nav_view.push(&nav_page);
 }
 
 fn build_provider_form(

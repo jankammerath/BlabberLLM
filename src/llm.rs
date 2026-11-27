@@ -11,7 +11,6 @@ use crate::tools::{self, is_dangerous_command};
 use crate::ui::message::MessageRole;
 
 const SHELL_TOOL_NAME: &str = "run_shell_command";
-const MAX_TOOL_TURNS: usize = 10;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ModelOption {
@@ -32,6 +31,7 @@ pub struct ShellToolConfig {
     pub enabled: bool,
     pub permission_mode: ShellPermissionMode,
     pub sudo_enabled: bool,
+    pub max_steps: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -236,7 +236,8 @@ where
     let mut conv = build_initial_conversation(account.kind, messages, tool_config.enabled);
     let mut accumulated_text = String::new();
 
-    for turn in 0..MAX_TOOL_TURNS {
+    let max_turns = tool_config.max_steps.max(1);
+    for turn in 0..max_turns {
         if cancel.load(Ordering::Relaxed) {
             break;
         }
