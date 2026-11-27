@@ -8,7 +8,7 @@ use std::time::Duration;
 use adw::prelude::*;
 use gtk::{gdk, gio, glib};
 
-use crate::chats::ChatStore;
+use crate::chats::{ChatStore, ToolCallRecord};
 use crate::llm::{self, ChatStreamEvent, ModelOption, ShellToolConfig, ShellToolRequest};
 use crate::settings::{AppSettings, ProviderAccount};
 
@@ -474,7 +474,7 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
             *active_chat_id.borrow_mut() = Some(chat.id.clone());
             clear_box(&messages_box);
             for msg in &chat.messages {
-                messages_box.append(&build_message_row(msg.role, &msg.content));
+                messages_box.append(&build_message_row(msg.role, &msg.content, &msg.tool_calls));
             }
             title.set_title(&chat.title);
             content_stack.set_visible_child_name(if chat.messages.is_empty() {
@@ -640,7 +640,7 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
             };
 
             content_stack.set_visible_child_name("chat");
-            messages_box.append(&build_message_row(MessageRole::User, &prompt_owned));
+            messages_box.append(&build_message_row(MessageRole::User, &prompt_owned, &[]));
 
             let assistant_handle = build_streaming_assistant_row(&option.display_label());
             messages_box.append(&assistant_handle.row);
@@ -714,6 +714,7 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
             });
 
             let accumulated = Rc::new(RefCell::new(String::new()));
+            let recorded_tools: Rc<RefCell<Vec<ToolCallRecord>>> = Rc::new(RefCell::new(Vec::new()));
             let chat_store_clone = Rc::clone(&chat_store);
             let active_chat_id_clone = Rc::clone(&active_chat_id);
             let active_stream_cancel_clone = Rc::clone(&active_stream_cancel);
@@ -744,6 +745,13 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
                                     command,
                                     working_directory,
                                 }) => {
+                                    recorded_tools.borrow_mut().push(ToolCallRecord {
+                                        command: command.clone(),
+                                        working_directory: working_directory.clone(),
+                                        exit_code: None,
+                                        output: String::new(),
+                                        denied: false,
+                                    });
                                     if active_chat_id_clone.borrow().as_deref()
                                         == Some(chat_id_for_stream.as_str())
                                     {
@@ -760,6 +768,26 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
                                     output,
                                     denied,
                                 }) => {
+                                    {
+                                        let mut tools = recorded_tools.borrow_mut();
+                                        if let Some(existing) = tools
+                                            .iter_mut()
+                                            .rev()
+                                            .find(|t| t.command == command && t.exit_code.is_none() && !t.denied)
+                                        {
+                                            existing.exit_code = exit_code;
+                                            existing.output = output.clone();
+                                            existing.denied = denied;
+                                        } else {
+                                            tools.push(ToolCallRecord {
+                                                command: command.clone(),
+                                                working_directory: None,
+                                                exit_code,
+                                                output: output.clone(),
+                                                denied,
+                                            });
+                                        }
+                                    }
                                     if active_chat_id_clone.borrow().as_deref()
                                         == Some(chat_id_for_stream.as_str())
                                     {
@@ -791,12 +819,16 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
 
                                     match result {
                                         Ok(final_text) => {
-                                            if !final_text.trim().is_empty() {
+                                            let tools_snapshot = recorded_tools.borrow().clone();
+                                            if !final_text.trim().is_empty()
+                                                || !tools_snapshot.is_empty()
+                                            {
                                                 let mut store = chat_store_clone.borrow_mut();
-                                                store.append_message(
+                                                store.append_message_with_tools(
                                                     &chat_id_for_stream,
                                                     MessageRole::Assistant,
                                                     final_text.clone(),
+                                                    tools_snapshot,
                                                 );
                                                 let current_active = active_chat_id_clone.borrow();
                                                 sidebar_clone.refresh(
@@ -804,7 +836,11 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
                                                     current_active.as_deref(),
                                                 );
                                                 if still_viewing {
-                                                    assistant_handle.set_content(&final_text);
+                                                    if !final_text.trim().is_empty() {
+                                                        assistant_handle.set_content(&final_text);
+                                                    } else {
+                                                        assistant_handle.set_plain_status("");
+                                                    }
                                                     scroll_to_bottom(&scrolled_window);
                                                 }
                                             } else if still_viewing {

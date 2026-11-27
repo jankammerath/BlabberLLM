@@ -7,9 +7,19 @@ use gtk::glib;
 use crate::ui::message::MessageRole;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToolCallRecord {
+    pub command: String,
+    pub working_directory: Option<String>,
+    pub exit_code: Option<i32>,
+    pub output: String,
+    pub denied: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChatMessage {
     pub role: MessageRole,
     pub content: String,
+    pub tool_calls: Vec<ToolCallRecord>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -123,12 +133,26 @@ impl ChatStore {
     }
 
     pub fn append_message(&mut self, chat_id: &str, role: MessageRole, content: String) {
+        self.append_message_with_tools(chat_id, role, content, Vec::new());
+    }
+
+    pub fn append_message_with_tools(
+        &mut self,
+        chat_id: &str,
+        role: MessageRole,
+        content: String,
+        tool_calls: Vec<ToolCallRecord>,
+    ) {
         let Some(pos) = self.chats.iter().position(|c| c.id == chat_id) else {
             return;
         };
 
         let mut chat = self.chats.remove(pos);
-        chat.messages.push(ChatMessage { role, content });
+        chat.messages.push(ChatMessage {
+            role,
+            content,
+            tool_calls,
+        });
         chat.updated_at = unix_timestamp_secs();
         self.chats.insert(0, chat);
 
@@ -172,6 +196,21 @@ impl ChatStore {
             let group = format!("message.{idx}");
             key_file.set_string(&group, "role", msg.role.as_str());
             key_file.set_string(&group, "content", &msg.content);
+            if !msg.tool_calls.is_empty() {
+                key_file.set_uint64(&group, "tool_count", msg.tool_calls.len() as u64);
+                for (t_idx, tool) in msg.tool_calls.iter().enumerate() {
+                    let tool_group = format!("message.{idx}.tool.{t_idx}");
+                    key_file.set_string(&tool_group, "command", &tool.command);
+                    if let Some(dir) = &tool.working_directory {
+                        key_file.set_string(&tool_group, "working_directory", dir);
+                    }
+                    if let Some(code) = tool.exit_code {
+                        key_file.set_integer(&tool_group, "exit_code", code);
+                    }
+                    key_file.set_string(&tool_group, "output", &tool.output);
+                    key_file.set_boolean(&tool_group, "denied", tool.denied);
+                }
+            }
         }
 
         let data = key_file.to_data();
@@ -221,7 +260,43 @@ fn load_chat_file(path: &Path) -> Option<ChatSession> {
             .string(&group, "content")
             .map(|s| s.to_string())
             .unwrap_or_default();
-        messages.push(ChatMessage { role, content });
+
+        let tool_count = key_file.uint64(&group, "tool_count").unwrap_or(0) as usize;
+        let mut tool_calls = Vec::with_capacity(tool_count);
+        for t_idx in 0..tool_count {
+            let tool_group = format!("message.{idx}.tool.{t_idx}");
+            if !key_file.has_group(&tool_group) {
+                continue;
+            }
+            let command = key_file
+                .string(&tool_group, "command")
+                .map(|s| s.to_string())
+                .unwrap_or_default();
+            let working_directory = key_file
+                .string(&tool_group, "working_directory")
+                .ok()
+                .map(|s| s.to_string())
+                .filter(|s| !s.is_empty());
+            let exit_code = key_file.integer(&tool_group, "exit_code").ok();
+            let output = key_file
+                .string(&tool_group, "output")
+                .map(|s| s.to_string())
+                .unwrap_or_default();
+            let denied = key_file.boolean(&tool_group, "denied").unwrap_or(false);
+            tool_calls.push(ToolCallRecord {
+                command,
+                working_directory,
+                exit_code,
+                output,
+                denied,
+            });
+        }
+
+        messages.push(ChatMessage {
+            role,
+            content,
+            tool_calls,
+        });
     }
 
     Some(ChatSession {
@@ -276,7 +351,18 @@ mod tests {
             Some("claude-sonnet-4-5".into()),
         );
         store.append_message(&id, MessageRole::User, "Hello\nsecond line".into());
-        store.append_message(&id, MessageRole::Assistant, "Hi there!".into());
+        store.append_message_with_tools(
+            &id,
+            MessageRole::Assistant,
+            "Hi there!".into(),
+            vec![ToolCallRecord {
+                command: "ls -la".into(),
+                working_directory: Some("/tmp".into()),
+                exit_code: Some(0),
+                output: "file1\nfile2".into(),
+                denied: false,
+            }],
+        );
         store.set_chat_model(&id, "provider-2".into(), "gpt-4o".into());
 
         let reloaded = ChatStore::load_from_dir(dir.clone());
@@ -290,6 +376,10 @@ mod tests {
         assert_eq!(chat.messages[0].content, "Hello\nsecond line");
         assert_eq!(chat.messages[1].role, MessageRole::Assistant);
         assert_eq!(chat.messages[1].content, "Hi there!");
+        assert_eq!(chat.messages[1].tool_calls.len(), 1);
+        assert_eq!(chat.messages[1].tool_calls[0].command, "ls -la");
+        assert_eq!(chat.messages[1].tool_calls[0].exit_code, Some(0));
+        assert_eq!(chat.messages[1].tool_calls[0].output, "file1\nfile2");
 
         let _ = fs::remove_dir_all(&dir);
     }

@@ -1,5 +1,5 @@
 use adw::prelude::*;
-use gtk::{gdk, glib, pango};
+use gtk::{gdk, pango};
 
 #[derive(Debug, PartialEq, Eq)]
 enum MarkdownBlock {
@@ -12,191 +12,163 @@ enum MarkdownBlock {
     HorizontalRule,
 }
 
-pub fn render_markdown_into(container: &gtk::Box, markdown: &str) {
-    while let Some(child) = container.first_child() {
-        container.remove(&child);
-    }
+/// Builds a read-only `gtk::TextView` that supports continuous text selection
+/// across the entire rendered Markdown response (headings, paragraphs, lists,
+/// blockquotes, and fenced code blocks).
+pub fn build_markdown_view() -> gtk::TextView {
+    let buffer = gtk::TextBuffer::new(None);
+    register_tags(&buffer);
+
+    let view = gtk::TextView::builder()
+        .buffer(&buffer)
+        .editable(false)
+        .cursor_visible(false)
+        .wrap_mode(gtk::WrapMode::WordChar)
+        .hexpand(true)
+        .build();
+    view.add_css_class("markdown-view");
+    view
+}
+
+pub fn set_markdown_content(view: &gtk::TextView, markdown: &str) {
+    let buffer = view.buffer();
+    buffer.set_text("");
 
     let blocks = parse_blocks(markdown);
     if blocks.is_empty() {
-        let label = gtk::Label::builder()
-            .label(markdown)
-            .wrap(true)
-            .wrap_mode(pango::WrapMode::WordChar)
-            .selectable(true)
-            .xalign(0.0)
-            .build();
-        container.append(&label);
+        buffer.set_text(markdown);
         return;
     }
 
-    for block in blocks {
+    let mut iter = buffer.end_iter();
+
+    for (idx, block) in blocks.iter().enumerate() {
+        if idx > 0 {
+            buffer.insert(&mut iter, "\n\n");
+        }
+
         match block {
             MarkdownBlock::Heading { level, text } => {
-                let markup = format_heading_markup(level, &text);
-                let label = build_markup_label(&markup);
-                label.add_css_class("markdown-heading");
-                container.append(&label);
+                let markup = format_heading_markup(*level, text);
+                buffer.insert_markup(&mut iter, &markup);
             }
             MarkdownBlock::Paragraph(text) => {
-                let markup = inline_to_pango(&text);
-                container.append(&build_markup_label(&markup));
+                let markup = inline_to_pango(text);
+                buffer.insert_markup(&mut iter, &markup);
             }
             MarkdownBlock::CodeBlock { language, code } => {
-                container.append(&build_code_block(&language, &code));
+                let start_offset = iter.offset();
+                if !language.is_empty() {
+                    let header_start = iter.offset();
+                    buffer.insert(&mut iter, &format!("{language}\n"));
+                    let s = buffer.iter_at_offset(header_start);
+                    buffer.apply_tag_by_name("code_lang", &s, &iter);
+                }
+                buffer.insert(&mut iter, code);
+                let s = buffer.iter_at_offset(start_offset);
+                buffer.apply_tag_by_name("code_block", &s, &iter);
             }
             MarkdownBlock::BulletList(items) => {
-                let list_box = gtk::Box::builder()
-                    .orientation(gtk::Orientation::Vertical)
-                    .spacing(4)
-                    .build();
-                list_box.add_css_class("markdown-list");
-                for item in items {
-                    let row = gtk::Box::builder()
-                        .orientation(gtk::Orientation::Horizontal)
-                        .spacing(8)
-                        .build();
-                    let bullet = gtk::Label::builder()
-                        .label("•")
-                        .valign(gtk::Align::Start)
-                        .build();
-                    bullet.add_css_class("dim-label");
-                    let content = build_markup_label(&inline_to_pango(&item));
-                    content.set_hexpand(true);
-                    row.append(&bullet);
-                    row.append(&content);
-                    list_box.append(&row);
+                for (item_idx, item) in items.iter().enumerate() {
+                    if item_idx > 0 {
+                        buffer.insert(&mut iter, "\n");
+                    }
+                    let start_offset = iter.offset();
+                    buffer.insert(&mut iter, "• ");
+                    let markup = inline_to_pango(item);
+                    buffer.insert_markup(&mut iter, &markup);
+                    let s = buffer.iter_at_offset(start_offset);
+                    buffer.apply_tag_by_name("list_item", &s, &iter);
                 }
-                container.append(&list_box);
             }
             MarkdownBlock::OrderedList(items) => {
-                let list_box = gtk::Box::builder()
-                    .orientation(gtk::Orientation::Vertical)
-                    .spacing(4)
-                    .build();
-                list_box.add_css_class("markdown-list");
-                for (num, item) in items {
-                    let row = gtk::Box::builder()
-                        .orientation(gtk::Orientation::Horizontal)
-                        .spacing(8)
-                        .build();
-                    let prefix = gtk::Label::builder()
-                        .label(format!("{num}."))
-                        .valign(gtk::Align::Start)
-                        .build();
-                    prefix.add_css_class("dim-label");
-                    let content = build_markup_label(&inline_to_pango(&item));
-                    content.set_hexpand(true);
-                    row.append(&prefix);
-                    row.append(&content);
-                    list_box.append(&row);
+                for (item_idx, (num, item)) in items.iter().enumerate() {
+                    if item_idx > 0 {
+                        buffer.insert(&mut iter, "\n");
+                    }
+                    let start_offset = iter.offset();
+                    buffer.insert(&mut iter, &format!("{num}. "));
+                    let markup = inline_to_pango(item);
+                    buffer.insert_markup(&mut iter, &markup);
+                    let s = buffer.iter_at_offset(start_offset);
+                    buffer.apply_tag_by_name("list_item", &s, &iter);
                 }
-                container.append(&list_box);
             }
             MarkdownBlock::BlockQuote(text) => {
-                let quote_box = gtk::Box::builder()
-                    .orientation(gtk::Orientation::Vertical)
-                    .build();
-                quote_box.add_css_class("markdown-quote");
-                let label = build_markup_label(&inline_to_pango(&text));
-                label.add_css_class("dim-label");
-                quote_box.append(&label);
-                container.append(&quote_box);
+                let start_offset = iter.offset();
+                let markup = inline_to_pango(text);
+                buffer.insert_markup(&mut iter, &markup);
+                let s = buffer.iter_at_offset(start_offset);
+                buffer.apply_tag_by_name("quote", &s, &iter);
             }
             MarkdownBlock::HorizontalRule => {
-                let sep = gtk::Separator::new(gtk::Orientation::Horizontal);
-                sep.set_margin_top(4);
-                sep.set_margin_bottom(4);
-                container.append(&sep);
+                let start_offset = iter.offset();
+                buffer.insert(&mut iter, "────────────────────────");
+                let s = buffer.iter_at_offset(start_offset);
+                buffer.apply_tag_by_name("dim", &s, &iter);
             }
         }
     }
 }
 
-fn build_markup_label(markup: &str) -> gtk::Label {
-    let label = gtk::Label::builder()
-        .wrap(true)
-        .wrap_mode(pango::WrapMode::WordChar)
-        .selectable(true)
-        .xalign(0.0)
-        .use_markup(true)
-        .build();
-    label.set_markup(markup);
-    label
+pub fn set_plain_dim_content(view: &gtk::TextView, text: &str) {
+    let buffer = view.buffer();
+    buffer.set_text(text);
+    let start = buffer.start_iter();
+    let end = buffer.end_iter();
+    buffer.apply_tag_by_name("dim", &start, &end);
 }
 
-fn build_code_block(language: &str, code: &str) -> gtk::Box {
-    let wrapper = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
+pub fn set_plain_content(view: &gtk::TextView, text: &str) {
+    view.buffer().set_text(text);
+}
+
+fn register_tags(buffer: &gtk::TextBuffer) {
+    let tag_table = buffer.tag_table();
+
+    let code_bg = gdk::RGBA::new(0.5, 0.5, 0.5, 0.14);
+    let code_block_tag = gtk::TextTag::builder()
+        .name("code_block")
+        .family("monospace")
+        .scale(0.92)
+        .left_margin(10)
+        .right_margin(10)
+        .pixels_above_lines(2)
+        .pixels_below_lines(2)
+        .paragraph_background_rgba(&code_bg)
         .build();
-    wrapper.add_css_class("markdown-code-block");
+    tag_table.add(&code_block_tag);
 
-    let header = gtk::Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .spacing(6)
+    let code_lang_tag = gtk::TextTag::builder()
+        .name("code_lang")
+        .scale(0.82)
+        .weight(600)
         .build();
-    header.add_css_class("markdown-code-header");
+    tag_table.add(&code_lang_tag);
 
-    let lang_label = gtk::Label::builder()
-        .label(if language.is_empty() {
-            "code"
-        } else {
-            language
-        })
-        .xalign(0.0)
-        .hexpand(true)
+    let list_item_tag = gtk::TextTag::builder()
+        .name("list_item")
+        .left_margin(14)
+        .indent(-14)
+        .pixels_below_lines(2)
         .build();
-    lang_label.add_css_class("dim-label");
-    lang_label.add_css_class("caption");
+    tag_table.add(&list_item_tag);
 
-    let copy_button = gtk::Button::builder()
-        .icon_name("edit-copy-symbolic")
-        .tooltip_text("Copy code")
-        .valign(gtk::Align::Center)
+    let quote_bg = gdk::RGBA::new(0.5, 0.5, 0.5, 0.08);
+    let quote_tag = gtk::TextTag::builder()
+        .name("quote")
+        .left_margin(14)
+        .right_margin(8)
+        .style(pango::Style::Italic)
+        .paragraph_background_rgba(&quote_bg)
         .build();
-    copy_button.add_css_class("flat");
-    copy_button.add_css_class("circular");
-    copy_button.add_css_class("code-copy-button");
+    tag_table.add(&quote_tag);
 
-    let code_owned = code.to_string();
-    copy_button.connect_clicked(move |btn| {
-        if let Some(display) = gdk::Display::default() {
-            display.clipboard().set_text(&code_owned);
-            btn.set_icon_name("object-select-symbolic");
-            glib::timeout_add_local_once(
-                std::time::Duration::from_millis(1200),
-                glib::clone!(
-                    #[weak]
-                    btn,
-                    move || {
-                        btn.set_icon_name("edit-copy-symbolic");
-                    }
-                ),
-            );
-        }
-    });
-
-    header.append(&lang_label);
-    header.append(&copy_button);
-
-    let code_label = gtk::Label::builder()
-        .label(code)
-        .selectable(true)
-        .xalign(0.0)
+    let dim_tag = gtk::TextTag::builder()
+        .name("dim")
+        .foreground_rgba(&gdk::RGBA::new(0.55, 0.55, 0.55, 1.0))
         .build();
-    code_label.add_css_class("monospace");
-    code_label.add_css_class("markdown-code-body");
-
-    let scroller = gtk::ScrolledWindow::builder()
-        .hscrollbar_policy(gtk::PolicyType::Automatic)
-        .vscrollbar_policy(gtk::PolicyType::Never)
-        .propagate_natural_height(true)
-        .child(&code_label)
-        .build();
-
-    wrapper.append(&header);
-    wrapper.append(&scroller);
-    wrapper
+    tag_table.add(&dim_tag);
 }
 
 fn format_heading_markup(level: u8, text: &str) -> String {
@@ -204,7 +176,6 @@ fn format_heading_markup(level: u8, text: &str) -> String {
     let size = match level {
         1 => "x-large",
         2 => "large",
-        3 => "medium",
         _ => "medium",
     };
     format!("<span size=\"{size}\" weight=\"bold\">{inner}</span>")
@@ -394,11 +365,11 @@ pub fn inline_to_pango(input: &str) -> String {
                     || safe_url.starts_with("https://")
                     || safe_url.starts_with("mailto:")
                 {
-                    out.push_str("<a href=\"");
-                    out.push_str(&escape_pango(safe_url));
-                    out.push_str("\">");
+                    out.push_str("<u>");
                     out.push_str(&inline_to_pango(&label));
-                    out.push_str("</a>");
+                    out.push_str("</u> (");
+                    out.push_str(&escape_pango(safe_url));
+                    out.push(')');
                     i = next_i;
                     continue;
                 }
@@ -418,7 +389,10 @@ pub fn inline_to_pango(input: &str) -> String {
         }
 
         // Bold: **text** or __text__
-        if i + 1 < len && ((chars[i] == '*' && chars[i + 1] == '*') || (chars[i] == '_' && chars[i + 1] == '_')) {
+        if i + 1 < len
+            && ((chars[i] == '*' && chars[i + 1] == '*')
+                || (chars[i] == '_' && chars[i + 1] == '_'))
+        {
             let marker = chars[i];
             if let Some(end) = find_closing_seq(&chars, i + 2, &[marker, marker]) {
                 let inner: String = chars[i + 2..end].iter().collect();
@@ -516,7 +490,7 @@ mod tests {
         );
         assert_eq!(
             inline_to_pango("See [Rust](https://rust-lang.org) and ~~old~~"),
-            "See <a href=\"https://rust-lang.org\">Rust</a> and <s>old</s>"
+            "See <u>Rust</u> (https://rust-lang.org) and <s>old</s>"
         );
     }
 

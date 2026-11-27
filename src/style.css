@@ -68,6 +68,11 @@
     margin-top: 4px;
 }
 
+.markdown-view,
+.markdown-view text {
+    background: transparent;
+}
+
 .markdown-list {
     margin-start: 4px;
 }
