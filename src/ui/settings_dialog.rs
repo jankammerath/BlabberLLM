@@ -367,7 +367,7 @@ pub fn present_settings_dialog(
 
     let about_row = adw::ActionRow::builder()
         .title("BlabberLLM")
-        .subtitle("Native GTK4 & Libadwaita LLM chat client")
+        .use_markup(false)
         .activatable(false)
         .build();
     let icon_bytes = glib::Bytes::from_static(include_bytes!(
