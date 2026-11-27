@@ -1,7 +1,7 @@
 # BlabberLLM
 
-An open Gtk3 LLM chat GUI for GNOME that works with well known LLMs and open weight models through Ollama.
+An open Gtk4 LLM chat GUI for GNOME that works with well known LLMs and open weight models through Ollama. It's written in Rust and follows the Adwaita design.
 
 ## Architecture
 
-The app uses standard Gtk3 and focuses on being simple, looking like a native Debian 13 app.
+The app uses standard Gtk4 and focuses on being simple, looking like a native Debian 13 app.
