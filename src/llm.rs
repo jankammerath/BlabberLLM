@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
-use crate::chats::ChatMessage;
+use crate::chats::{ChatMessage, ToolCallRecord};
 use crate::settings::{ProviderAccount, ProviderKind, ShellPermissionMode};
 use crate::tools::{self, is_dangerous_command};
 use crate::ui::message::MessageRole;
@@ -233,7 +233,7 @@ where
     }
 
     let agent = build_agent(300);
-    let mut conv = build_initial_conversation(account.kind, messages);
+    let mut conv = build_initial_conversation(account.kind, messages, tool_config.enabled);
     let mut accumulated_text = String::new();
 
     for turn in 0..MAX_TOOL_TURNS {
@@ -386,30 +386,246 @@ where
     exec_result.format_for_llm()
 }
 
-fn build_initial_conversation(kind: ProviderKind, messages: &[ChatMessage]) -> Vec<Value> {
-    match kind {
-        ProviderKind::Gemini => messages
-            .iter()
-            .map(|m| {
-                json!({
-                    "role": match m.role {
-                        MessageRole::User => "user",
-                        MessageRole::Assistant => "model",
-                    },
-                    "parts": [{ "text": m.content }],
-                })
-            })
-            .collect(),
-        _ => messages
-            .iter()
-            .map(|m| {
-                json!({
-                    "role": m.role.as_str(),
-                    "content": m.content,
-                })
-            })
-            .collect(),
+fn format_tool_record_for_llm(tool: &ToolCallRecord) -> String {
+    if tool.denied {
+        return "User denied permission to run this shell command.".to_string();
     }
+    let exit_str = tool
+        .exit_code
+        .map(|c| c.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    if tool.output.trim().is_empty() {
+        format!("Exit code: {exit_str}\n(no output)")
+    } else {
+        format!("Exit code: {exit_str}\nOutput:\n{}", tool.output)
+    }
+}
+
+fn tool_record_args_json(tool: &ToolCallRecord) -> Value {
+    let mut args = json!({ "command": tool.command });
+    if let Some(dir) = &tool.working_directory {
+        args["working_directory"] = Value::String(dir.clone());
+    }
+    args
+}
+
+fn format_tool_history_fallback(tool_calls: &[ToolCallRecord], content: &str) -> String {
+    let mut summary = String::from("[Previously executed shell commands:\n");
+    for tool in tool_calls {
+        let status = if tool.denied {
+            "denied".to_string()
+        } else if let Some(code) = tool.exit_code {
+            format!("exit {code}")
+        } else {
+            "done".to_string()
+        };
+        summary.push_str(&format!("- `$ {}` ({status})\n", tool.command));
+        if !tool.output.trim().is_empty() {
+            let preview: String = tool.output.chars().take(1000).collect();
+            summary.push_str(&format!("  Output: {preview}\n"));
+        }
+    }
+    summary.push_str("]\n\n");
+    summary.push_str(content);
+    summary
+}
+
+fn build_initial_conversation(
+    kind: ProviderKind,
+    messages: &[ChatMessage],
+    tools_enabled: bool,
+) -> Vec<Value> {
+    let mut conv = Vec::new();
+
+    for (msg_idx, msg) in messages.iter().enumerate() {
+        if msg.role == MessageRole::Assistant && !msg.tool_calls.is_empty() {
+            if !tools_enabled {
+                let text = format_tool_history_fallback(&msg.tool_calls, &msg.content);
+                match kind {
+                    ProviderKind::Gemini => conv.push(json!({
+                        "role": "model",
+                        "parts": [{ "text": text }],
+                    })),
+                    _ => conv.push(json!({
+                        "role": "assistant",
+                        "content": text,
+                    })),
+                }
+                continue;
+            }
+
+            match kind {
+                ProviderKind::OpenAi | ProviderKind::Grok | ProviderKind::OpenRouter => {
+                    let tool_calls_json: Vec<Value> = msg
+                        .tool_calls
+                        .iter()
+                        .enumerate()
+                        .map(|(t_idx, tool)| {
+                            json!({
+                                "id": format!("hist_call_{msg_idx}_{t_idx}"),
+                                "type": "function",
+                                "function": {
+                                    "name": SHELL_TOOL_NAME,
+                                    "arguments": tool_record_args_json(tool).to_string(),
+                                }
+                            })
+                        })
+                        .collect();
+                    conv.push(json!({
+                        "role": "assistant",
+                        "content": Value::Null,
+                        "tool_calls": tool_calls_json,
+                    }));
+                    for (t_idx, tool) in msg.tool_calls.iter().enumerate() {
+                        conv.push(json!({
+                            "role": "tool",
+                            "tool_call_id": format!("hist_call_{msg_idx}_{t_idx}"),
+                            "content": format_tool_record_for_llm(tool),
+                        }));
+                    }
+                    if !msg.content.trim().is_empty() {
+                        conv.push(json!({
+                            "role": "assistant",
+                            "content": msg.content,
+                        }));
+                    }
+                }
+                ProviderKind::Claude => {
+                    let tool_use_blocks: Vec<Value> = msg
+                        .tool_calls
+                        .iter()
+                        .enumerate()
+                        .map(|(t_idx, tool)| {
+                            json!({
+                                "type": "tool_use",
+                                "id": format!("hist_tool_{msg_idx}_{t_idx}"),
+                                "name": SHELL_TOOL_NAME,
+                                "input": tool_record_args_json(tool),
+                            })
+                        })
+                        .collect();
+                    conv.push(json!({
+                        "role": "assistant",
+                        "content": tool_use_blocks,
+                    }));
+
+                    let tool_result_blocks: Vec<Value> = msg
+                        .tool_calls
+                        .iter()
+                        .enumerate()
+                        .map(|(t_idx, tool)| {
+                            json!({
+                                "type": "tool_result",
+                                "tool_use_id": format!("hist_tool_{msg_idx}_{t_idx}"),
+                                "content": format_tool_record_for_llm(tool),
+                            })
+                        })
+                        .collect();
+                    conv.push(json!({
+                        "role": "user",
+                        "content": tool_result_blocks,
+                    }));
+
+                    if !msg.content.trim().is_empty() {
+                        conv.push(json!({
+                            "role": "assistant",
+                            "content": msg.content,
+                        }));
+                    }
+                }
+                ProviderKind::Gemini => {
+                    let call_parts: Vec<Value> = msg
+                        .tool_calls
+                        .iter()
+                        .map(|tool| {
+                            json!({
+                                "functionCall": {
+                                    "name": SHELL_TOOL_NAME,
+                                    "args": tool_record_args_json(tool),
+                                }
+                            })
+                        })
+                        .collect();
+                    conv.push(json!({
+                        "role": "model",
+                        "parts": call_parts,
+                    }));
+
+                    let response_parts: Vec<Value> = msg
+                        .tool_calls
+                        .iter()
+                        .map(|tool| {
+                            json!({
+                                "functionResponse": {
+                                    "name": SHELL_TOOL_NAME,
+                                    "response": { "output": format_tool_record_for_llm(tool) },
+                                }
+                            })
+                        })
+                        .collect();
+                    conv.push(json!({
+                        "role": "user",
+                        "parts": response_parts,
+                    }));
+
+                    if !msg.content.trim().is_empty() {
+                        conv.push(json!({
+                            "role": "model",
+                            "parts": [{ "text": msg.content }],
+                        }));
+                    }
+                }
+                ProviderKind::Ollama => {
+                    let tool_calls_json: Vec<Value> = msg
+                        .tool_calls
+                        .iter()
+                        .map(|tool| {
+                            json!({
+                                "function": {
+                                    "name": SHELL_TOOL_NAME,
+                                    "arguments": tool_record_args_json(tool),
+                                }
+                            })
+                        })
+                        .collect();
+                    conv.push(json!({
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": tool_calls_json,
+                    }));
+                    for tool in &msg.tool_calls {
+                        conv.push(json!({
+                            "role": "tool",
+                            "content": format_tool_record_for_llm(tool),
+                        }));
+                    }
+                    if !msg.content.trim().is_empty() {
+                        conv.push(json!({
+                            "role": "assistant",
+                            "content": msg.content,
+                        }));
+                    }
+                }
+            }
+            continue;
+        }
+
+        match kind {
+            ProviderKind::Gemini => conv.push(json!({
+                "role": match msg.role {
+                    MessageRole::User => "user",
+                    MessageRole::Assistant => "model",
+                },
+                "parts": [{ "text": msg.content }],
+            })),
+            _ => conv.push(json!({
+                "role": msg.role.as_str(),
+                "content": msg.content,
+            })),
+        }
+    }
+
+    conv
 }
 
 fn append_tool_turn(
@@ -1118,5 +1334,59 @@ mod tests {
     fn extracts_json_error_messages() {
         let body = r#"{"error":{"message":"Invalid API key"}}"#;
         assert_eq!(extract_error_message(401, body), "HTTP 401: Invalid API key");
+    }
+
+    #[test]
+    fn replays_prior_tool_calls_in_conversation_history() {
+        let messages = vec![
+            ChatMessage {
+                role: MessageRole::User,
+                content: "Check my OS".into(),
+                tool_calls: Vec::new(),
+                duration_ms: None,
+            },
+            ChatMessage {
+                role: MessageRole::Assistant,
+                content: "You are on Debian 13.".into(),
+                tool_calls: vec![ToolCallRecord {
+                    command: "uname -a".into(),
+                    working_directory: None,
+                    exit_code: Some(0),
+                    output: "Linux debian 6.12".into(),
+                    denied: false,
+                }],
+                duration_ms: Some(1200),
+            },
+            ChatMessage {
+                role: MessageRole::User,
+                content: "Now switch layout".into(),
+                tool_calls: Vec::new(),
+                duration_ms: None,
+            },
+        ];
+
+        // Claude: user -> assistant(tool_use) -> user(tool_result) -> assistant(text) -> user
+        let claude = build_initial_conversation(ProviderKind::Claude, &messages, true);
+        assert_eq!(claude.len(), 5);
+        assert_eq!(claude[1]["role"], "assistant");
+        assert_eq!(claude[1]["content"][0]["type"], "tool_use");
+        assert_eq!(claude[2]["role"], "user");
+        assert_eq!(claude[2]["content"][0]["type"], "tool_result");
+        assert_eq!(claude[3]["role"], "assistant");
+        assert_eq!(claude[3]["content"], "You are on Debian 13.");
+
+        // OpenAI: user -> assistant(tool_calls) -> tool -> assistant(text) -> user
+        let openai = build_initial_conversation(ProviderKind::OpenAi, &messages, true);
+        assert_eq!(openai.len(), 5);
+        assert_eq!(openai[1]["tool_calls"][0]["function"]["name"], "run_shell_command");
+        assert_eq!(openai[2]["role"], "tool");
+
+        // Tools disabled: plain text fallback preserves knowledge without tool_use blocks
+        let disabled = build_initial_conversation(ProviderKind::Claude, &messages, false);
+        assert_eq!(disabled.len(), 3);
+        assert!(disabled[1]["content"]
+            .as_str()
+            .unwrap()
+            .contains("uname -a"));
     }
 }
