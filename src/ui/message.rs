@@ -7,6 +7,23 @@ pub enum MessageRole {
     Assistant,
 }
 
+impl MessageRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MessageRole::User => "user",
+            MessageRole::Assistant => "assistant",
+        }
+    }
+
+    pub fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "user" => Some(MessageRole::User),
+            "assistant" => Some(MessageRole::Assistant),
+            _ => None,
+        }
+    }
+}
+
 pub fn build_message_row(role: MessageRole, text: &str) -> gtk::Box {
     let row = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)

@@ -39,3 +39,17 @@
 .composer-placeholder {
     padding: 6px 4px;
 }
+
+.sidebar-chat-row {
+    padding: 6px 4px;
+}
+
+.sidebar-delete-button {
+    opacity: 0.65;
+    min-width: 28px;
+    min-height: 28px;
+}
+
+.sidebar-delete-button:hover {
+    opacity: 1.0;
+}

@@ -1,3 +1,5 @@
+mod chats;
+mod settings;
 mod ui;
 
 use adw::prelude::*;
@@ -49,4 +51,6 @@ fn setup_app_actions(app: &adw::Application) {
     app.add_action_entries([quit_action]);
     app.set_accels_for_action("app.quit", &["<Primary>q"]);
     app.set_accels_for_action("win.new-chat", &["<Primary>n"]);
+    app.set_accels_for_action("win.preferences", &["<Primary>comma"]);
+    app.set_accels_for_action("win.toggle-sidebar", &["F9"]);
 }
