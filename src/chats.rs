@@ -17,11 +17,17 @@ pub struct ChatSession {
     pub id: String,
     pub title: String,
     pub updated_at: i64,
+    pub last_account_id: Option<String>,
+    pub last_model: Option<String>,
     pub messages: Vec<ChatMessage>,
 }
 
 impl ChatSession {
-    pub fn new(first_prompt: &str) -> Self {
+    pub fn new(
+        first_prompt: &str,
+        last_account_id: Option<String>,
+        last_model: Option<String>,
+    ) -> Self {
         let now = unix_timestamp_secs();
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -31,6 +37,8 @@ impl ChatSession {
             id: format!("chat-{nanos}"),
             title: title_from_prompt(first_prompt),
             updated_at: now,
+            last_account_id,
+            last_model,
             messages: Vec::new(),
         }
     }
@@ -87,12 +95,31 @@ impl ChatStore {
         self.chats.iter().find(|c| c.id == id)
     }
 
-    pub fn create_chat(&mut self, first_prompt: &str) -> String {
-        let chat = ChatSession::new(first_prompt);
+    pub fn create_chat(
+        &mut self,
+        first_prompt: &str,
+        account_id: Option<String>,
+        model: Option<String>,
+    ) -> String {
+        let chat = ChatSession::new(first_prompt, account_id, model);
         let id = chat.id.clone();
         self.chats.insert(0, chat);
         let _ = self.save_chat(&id);
         id
+    }
+
+    pub fn set_chat_model(&mut self, chat_id: &str, account_id: String, model: String) {
+        let Some(chat) = self.chats.iter_mut().find(|c| c.id == chat_id) else {
+            return;
+        };
+        if chat.last_account_id.as_deref() == Some(account_id.as_str())
+            && chat.last_model.as_deref() == Some(model.as_str())
+        {
+            return;
+        }
+        chat.last_account_id = Some(account_id);
+        chat.last_model = Some(model);
+        let _ = self.save_chat(chat_id);
     }
 
     pub fn append_message(&mut self, chat_id: &str, role: MessageRole, content: String) {
@@ -133,6 +160,12 @@ impl ChatStore {
         key_file.set_string("chat", "id", &chat.id);
         key_file.set_string("chat", "title", &chat.title);
         key_file.set_int64("chat", "updated_at", chat.updated_at);
+        if let Some(account_id) = &chat.last_account_id {
+            key_file.set_string("chat", "last_account_id", account_id);
+        }
+        if let Some(model) = &chat.last_model {
+            key_file.set_string("chat", "last_model", model);
+        }
         key_file.set_uint64("chat", "message_count", chat.messages.len() as u64);
 
         for (idx, msg) in chat.messages.iter().enumerate() {
@@ -159,6 +192,16 @@ fn load_chat_file(path: &Path) -> Option<ChatSession> {
         .map(|s| s.to_string())
         .unwrap_or_else(|_| "Untitled Chat".to_string());
     let updated_at = key_file.int64("chat", "updated_at").unwrap_or(0);
+    let last_account_id = key_file
+        .string("chat", "last_account_id")
+        .ok()
+        .map(|s| s.to_string())
+        .filter(|s| !s.is_empty());
+    let last_model = key_file
+        .string("chat", "last_model")
+        .ok()
+        .map(|s| s.to_string())
+        .filter(|s| !s.is_empty());
     let message_count = key_file.uint64("chat", "message_count").unwrap_or(0) as usize;
 
     let mut messages = Vec::with_capacity(message_count);
@@ -185,6 +228,8 @@ fn load_chat_file(path: &Path) -> Option<ChatSession> {
         id,
         title,
         updated_at,
+        last_account_id,
+        last_model,
         messages,
     })
 }
@@ -225,14 +270,21 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
 
         let mut store = ChatStore::load_from_dir(dir.clone());
-        let id = store.create_chat("Hello\nsecond line");
+        let id = store.create_chat(
+            "Hello\nsecond line",
+            Some("provider-1".into()),
+            Some("claude-sonnet-4-5".into()),
+        );
         store.append_message(&id, MessageRole::User, "Hello\nsecond line".into());
         store.append_message(&id, MessageRole::Assistant, "Hi there!".into());
+        store.set_chat_model(&id, "provider-2".into(), "gpt-4o".into());
 
         let reloaded = ChatStore::load_from_dir(dir.clone());
         assert_eq!(reloaded.chats().len(), 1);
         let chat = reloaded.get(&id).expect("chat persisted");
         assert_eq!(chat.title, "Hello");
+        assert_eq!(chat.last_account_id.as_deref(), Some("provider-2"));
+        assert_eq!(chat.last_model.as_deref(), Some("gpt-4o"));
         assert_eq!(chat.messages.len(), 2);
         assert_eq!(chat.messages[0].role, MessageRole::User);
         assert_eq!(chat.messages[0].content, "Hello\nsecond line");

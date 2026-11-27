@@ -169,8 +169,8 @@ impl ShellPermissionMode {
 #[derive(Clone, Debug, Default)]
 pub struct AppSettings {
     accounts: Vec<ProviderAccount>,
-    selected_account_id: Option<String>,
-    selected_model: Option<String>,
+    default_account_id: Option<String>,
+    default_model: Option<String>,
     shell_tool_enabled: bool,
     shell_permission_mode: ShellPermissionMode,
 }
@@ -197,13 +197,24 @@ impl AppSettings {
             return settings;
         }
 
-        if key_file.has_group("selection") {
-            settings.selected_account_id = key_file
+        if key_file.has_group("defaults") {
+            settings.default_account_id = key_file
+                .string("defaults", "account_id")
+                .ok()
+                .map(|s| s.to_string())
+                .filter(|s| !s.is_empty());
+            settings.default_model = key_file
+                .string("defaults", "model")
+                .ok()
+                .map(|s| s.to_string())
+                .filter(|s| !s.is_empty());
+        } else if key_file.has_group("selection") {
+            settings.default_account_id = key_file
                 .string("selection", "account_id")
                 .ok()
                 .map(|s| s.to_string())
                 .filter(|s| !s.is_empty());
-            settings.selected_model = key_file
+            settings.default_model = key_file
                 .string("selection", "model")
                 .ok()
                 .map(|s| s.to_string())
@@ -296,11 +307,11 @@ impl AppSettings {
         }
 
         let key_file = glib::KeyFile::new();
-        if let Some(account_id) = &self.selected_account_id {
-            key_file.set_string("selection", "account_id", account_id);
+        if let Some(account_id) = &self.default_account_id {
+            key_file.set_string("defaults", "account_id", account_id);
         }
-        if let Some(model) = &self.selected_model {
-            key_file.set_string("selection", "model", model);
+        if let Some(model) = &self.default_model {
+            key_file.set_string("defaults", "model", model);
         }
         key_file.set_boolean("tools", "shell_enabled", self.shell_tool_enabled);
         key_file.set_string("tools", "shell_permission", self.shell_permission_mode.key());
@@ -360,6 +371,10 @@ impl AppSettings {
             return false;
         };
         self.accounts.remove(pos);
+        if self.default_account_id.as_deref() == Some(id) {
+            self.default_account_id = None;
+            self.default_model = None;
+        }
         true
     }
 
@@ -367,19 +382,19 @@ impl AppSettings {
         self.accounts.iter().filter(|a| a.is_configured()).count()
     }
 
-    pub fn selected_model(&self) -> Option<(&str, &str)> {
+    pub fn default_model(&self) -> Option<(&str, &str)> {
         match (
-            self.selected_account_id.as_deref(),
-            self.selected_model.as_deref(),
+            self.default_account_id.as_deref(),
+            self.default_model.as_deref(),
         ) {
             (Some(account_id), Some(model)) => Some((account_id, model)),
             _ => None,
         }
     }
 
-    pub fn set_selected_model(&mut self, account_id: Option<String>, model: Option<String>) {
-        self.selected_account_id = account_id;
-        self.selected_model = model;
+    pub fn set_default_model(&mut self, account_id: Option<String>, model: Option<String>) {
+        self.default_account_id = account_id;
+        self.default_model = model;
     }
 
     pub fn shell_tool_enabled(&self) -> bool {
@@ -434,6 +449,7 @@ mod tests {
         settings.add_account(work_openai.clone());
         settings.add_account(personal_openai.clone());
         settings.add_account(ollama.clone());
+        settings.set_default_model(Some(work_openai.id.clone()), Some("gpt-4o".into()));
 
         settings.save_to_path(&path).expect("save settings");
         let loaded = AppSettings::load_from_path(&path);
@@ -443,6 +459,10 @@ mod tests {
         assert_eq!(loaded.get(&work_openai.id), Some(&work_openai));
         assert_eq!(loaded.get(&personal_openai.id), Some(&personal_openai));
         assert_eq!(loaded.get(&ollama.id), Some(&ollama));
+        assert_eq!(
+            loaded.default_model(),
+            Some((work_openai.id.as_str(), "gpt-4o"))
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

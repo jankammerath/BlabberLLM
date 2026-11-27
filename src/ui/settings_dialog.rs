@@ -1,14 +1,16 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use adw::prelude::*;
 use gtk::glib;
 
+use crate::llm::{self, ModelOption};
 use crate::settings::{AppSettings, ProviderAccount, ProviderKind, ShellPermissionMode};
 
 pub fn present_settings_dialog(
     parent: &adw::ApplicationWindow,
     settings: Rc<RefCell<AppSettings>>,
+    model_options: Rc<RefCell<Vec<ModelOption>>>,
     on_changed: Rc<dyn Fn()>,
 ) {
     let dialog = adw::PreferencesDialog::builder()
@@ -43,6 +45,234 @@ pub fn present_settings_dialog(
     providers_group.set_header_suffix(Some(&add_button));
 
     providers_page.add(&providers_group);
+
+    let defaults_group = adw::PreferencesGroup::builder()
+        .title("Default Model")
+        .description("Provider and model selected automatically when starting a new chat.")
+        .build();
+
+    let default_provider_row = adw::ComboRow::builder()
+        .title("Default Provider")
+        .sensitive(false)
+        .build();
+
+    let default_model_search_expr = gtk::PropertyExpression::new(
+        gtk::StringObject::static_type(),
+        gtk::Expression::NONE,
+        "string",
+    );
+    let default_model_row = adw::ComboRow::builder()
+        .title("Default Model")
+        .expression(&default_model_search_expr)
+        .enable_search(true)
+        .sensitive(false)
+        .build();
+
+    defaults_group.add(&default_provider_row);
+    defaults_group.add(&default_model_row);
+    providers_page.add(&defaults_group);
+
+    let default_accounts_state: Rc<RefCell<Vec<ProviderAccount>>> = Rc::new(RefCell::new(Vec::new()));
+    let default_models_state: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+    let suppress_defaults = Rc::new(Cell::new(false));
+
+    let populate_default_models: Rc<dyn Fn(&ProviderAccount, Option<&str>)> = Rc::new(glib::clone!(
+        #[weak]
+        default_model_row,
+        #[strong]
+        model_options,
+        #[strong]
+        default_models_state,
+        #[strong]
+        suppress_defaults,
+        move |account: &ProviderAccount, preferred_model: Option<&str>| {
+            let prev_suppress = suppress_defaults.get();
+            suppress_defaults.set(true);
+
+            let mut models: Vec<String> = model_options
+                .borrow()
+                .iter()
+                .filter(|opt| opt.account_id == account.id)
+                .map(|opt| opt.model.clone())
+                .collect();
+
+            if models.is_empty() {
+                models = llm::fallback_models(account.kind)
+                    .iter()
+                    .map(|m| (*m).to_string())
+                    .collect();
+            }
+
+            if let Some(pref) = preferred_model {
+                if !pref.trim().is_empty() && !models.iter().any(|m| m == pref) {
+                    models.insert(0, pref.to_string());
+                }
+            }
+
+            if models.is_empty() {
+                let placeholder = gtk::StringList::new(&["No models available"]);
+                default_model_row.set_model(Some(&placeholder));
+                default_model_row.set_selected(0);
+                default_model_row.set_sensitive(false);
+                *default_models_state.borrow_mut() = Vec::new();
+            } else {
+                let refs: Vec<&str> = models.iter().map(String::as_str).collect();
+                let list = gtk::StringList::new(&refs);
+                default_model_row.set_model(Some(&list));
+                default_model_row.set_sensitive(true);
+                let idx = preferred_model
+                    .and_then(|pref| models.iter().position(|m| m == pref))
+                    .unwrap_or(0);
+                default_model_row.set_selected(idx as u32);
+                *default_models_state.borrow_mut() = models;
+            }
+
+            suppress_defaults.set(prev_suppress);
+        }
+    ));
+
+    let refresh_defaults: Rc<dyn Fn()> = Rc::new(glib::clone!(
+        #[weak]
+        default_provider_row,
+        #[weak]
+        default_model_row,
+        #[strong]
+        settings,
+        #[strong]
+        default_accounts_state,
+        #[strong]
+        default_models_state,
+        #[strong]
+        suppress_defaults,
+        #[strong]
+        populate_default_models,
+        move || {
+            suppress_defaults.set(true);
+
+            let configured: Vec<ProviderAccount> = settings
+                .borrow()
+                .accounts()
+                .iter()
+                .filter(|a| a.is_configured())
+                .cloned()
+                .collect();
+
+            if configured.is_empty() {
+                let no_providers = gtk::StringList::new(&["No configured providers"]);
+                default_provider_row.set_model(Some(&no_providers));
+                default_provider_row.set_selected(0);
+                default_provider_row.set_sensitive(false);
+
+                let no_models = gtk::StringList::new(&["No models available"]);
+                default_model_row.set_model(Some(&no_models));
+                default_model_row.set_selected(0);
+                default_model_row.set_sensitive(false);
+
+                *default_accounts_state.borrow_mut() = Vec::new();
+                *default_models_state.borrow_mut() = Vec::new();
+                suppress_defaults.set(false);
+                return;
+            }
+
+            let labels: Vec<String> = configured
+                .iter()
+                .map(|a| format!("{} ({})", a.name, a.kind.display_name()))
+                .collect();
+            let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+            let list = gtk::StringList::new(&refs);
+            default_provider_row.set_model(Some(&list));
+            default_provider_row.set_sensitive(true);
+
+            let (saved_acc_id, saved_model) = settings
+                .borrow()
+                .default_model()
+                .map(|(a, m)| (Some(a.to_string()), Some(m.to_string())))
+                .unwrap_or((None, None));
+
+            let acc_idx = saved_acc_id
+                .as_deref()
+                .and_then(|id| configured.iter().position(|a| a.id == id))
+                .unwrap_or(0);
+            default_provider_row.set_selected(acc_idx as u32);
+
+            let selected_account = configured[acc_idx].clone();
+            let preferred_model = if saved_acc_id.as_deref() == Some(selected_account.id.as_str()) {
+                saved_model.as_deref()
+            } else {
+                None
+            };
+            populate_default_models(&selected_account, preferred_model);
+
+            *default_accounts_state.borrow_mut() = configured;
+            suppress_defaults.set(false);
+        }
+    ));
+
+    default_provider_row.connect_selected_notify(glib::clone!(
+        #[strong]
+        settings,
+        #[strong]
+        default_accounts_state,
+        #[strong]
+        default_models_state,
+        #[strong]
+        suppress_defaults,
+        #[strong]
+        populate_default_models,
+        #[strong]
+        on_changed,
+        move |row| {
+            if suppress_defaults.get() {
+                return;
+            }
+            let idx = row.selected() as usize;
+            let Some(account) = default_accounts_state.borrow().get(idx).cloned() else {
+                return;
+            };
+            populate_default_models(&account, None);
+            let chosen_model = default_models_state.borrow().first().cloned();
+            {
+                let mut guard = settings.borrow_mut();
+                guard.set_default_model(Some(account.id), chosen_model);
+                let _ = guard.save();
+            }
+            on_changed();
+        }
+    ));
+
+    default_model_row.connect_selected_notify(glib::clone!(
+        #[weak]
+        default_provider_row,
+        #[strong]
+        settings,
+        #[strong]
+        default_accounts_state,
+        #[strong]
+        default_models_state,
+        #[strong]
+        suppress_defaults,
+        #[strong]
+        on_changed,
+        move |row| {
+            if suppress_defaults.get() {
+                return;
+            }
+            let acc_idx = default_provider_row.selected() as usize;
+            let model_idx = row.selected() as usize;
+            let Some(account) = default_accounts_state.borrow().get(acc_idx).cloned() else {
+                return;
+            };
+            let Some(model) = default_models_state.borrow().get(model_idx).cloned() else {
+                return;
+            };
+            {
+                let mut guard = settings.borrow_mut();
+                guard.set_default_model(Some(account.id), Some(model));
+                let _ = guard.save();
+            }
+            on_changed();
+        }
+    ));
 
     let tools_group = adw::PreferencesGroup::builder()
         .title("Tools")
@@ -116,7 +346,11 @@ pub fn present_settings_dialog(
         on_changed,
         #[strong]
         refresh_slot,
+        #[strong]
+        refresh_defaults,
         move || {
+            refresh_defaults();
+
             while let Some(child) = list_box.first_child() {
                 list_box.remove(&child);
             }

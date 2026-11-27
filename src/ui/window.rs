@@ -192,17 +192,68 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
         move |_| update_send_button_state()
     });
 
-    let apply_model_options: Rc<dyn Fn(Vec<ModelOption>)> = Rc::new(glib::clone!(
+    let select_model_for_current_context: Rc<dyn Fn()> = Rc::new(glib::clone!(
         #[weak]
         model_dropdown,
         #[strong]
         settings,
+        #[strong]
+        chat_store,
+        #[strong]
+        active_chat_id,
         #[strong]
         model_options,
         #[strong]
         suppress_model_selection,
         #[strong]
         update_send_button_state,
+        move || {
+            let options = model_options.borrow();
+            if options.is_empty() {
+                return;
+            }
+
+            let chat_pref = active_chat_id.borrow().as_deref().and_then(|id| {
+                let store = chat_store.borrow();
+                let chat = store.get(id)?;
+                Some((chat.last_account_id.clone()?, chat.last_model.clone()?))
+            });
+
+            let default_pref = settings
+                .borrow()
+                .default_model()
+                .map(|(a, m)| (a.to_string(), m.to_string()));
+
+            let find_index = |(acc_id, model): &(String, String)| {
+                options
+                    .iter()
+                    .position(|opt| opt.account_id == *acc_id && opt.model == *model)
+            };
+
+            let target_idx = chat_pref
+                .as_ref()
+                .and_then(find_index)
+                .or_else(|| default_pref.as_ref().and_then(find_index))
+                .unwrap_or(0);
+
+            suppress_model_selection.set(true);
+            model_dropdown.set_selected(target_idx as u32);
+            suppress_model_selection.set(false);
+            update_send_button_state();
+        }
+    ));
+
+    let apply_model_options: Rc<dyn Fn(Vec<ModelOption>)> = Rc::new(glib::clone!(
+        #[weak]
+        model_dropdown,
+        #[strong]
+        model_options,
+        #[strong]
+        suppress_model_selection,
+        #[strong]
+        update_send_button_state,
+        #[strong]
+        select_model_for_current_context,
         move |options: Vec<ModelOption>| {
             suppress_model_selection.set(true);
 
@@ -222,42 +273,16 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
             let list = gtk::StringList::new(&label_refs);
             model_dropdown.set_model(Some(&list));
             model_dropdown.set_sensitive(true);
-
-            let selected_idx = {
-                let guard = settings.borrow();
-                guard
-                    .selected_model()
-                    .and_then(|(acc_id, model)| {
-                        options
-                            .iter()
-                            .position(|opt| opt.account_id == acc_id && opt.model == model)
-                    })
-                    .unwrap_or(0)
-            };
-
-            model_dropdown.set_selected(selected_idx as u32);
-
-            if let Some(chosen) = options.get(selected_idx) {
-                let mut guard = settings.borrow_mut();
-                let needs_update = guard.selected_model()
-                    != Some((chosen.account_id.as_str(), chosen.model.as_str()));
-                if needs_update {
-                    guard.set_selected_model(
-                        Some(chosen.account_id.clone()),
-                        Some(chosen.model.clone()),
-                    );
-                    let _ = guard.save();
-                }
-            }
-
             *model_options.borrow_mut() = options;
             suppress_model_selection.set(false);
-            update_send_button_state();
+
+            select_model_for_current_context();
         }
     ));
 
     model_dropdown.connect_selected_notify({
-        let settings = Rc::clone(&settings);
+        let chat_store = Rc::clone(&chat_store);
+        let active_chat_id = Rc::clone(&active_chat_id);
         let model_options = Rc::clone(&model_options);
         let suppress_model_selection = Rc::clone(&suppress_model_selection);
         let update_send_button_state = Rc::clone(&update_send_button_state);
@@ -267,12 +292,13 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
             }
             let idx = dropdown.selected() as usize;
             if let Some(chosen) = model_options.borrow().get(idx) {
-                let mut guard = settings.borrow_mut();
-                guard.set_selected_model(
-                    Some(chosen.account_id.clone()),
-                    Some(chosen.model.clone()),
-                );
-                let _ = guard.save();
+                if let Some(chat_id) = active_chat_id.borrow().as_deref() {
+                    chat_store.borrow_mut().set_chat_model(
+                        chat_id,
+                        chosen.account_id.clone(),
+                        chosen.model.clone(),
+                    );
+                }
             }
             update_send_button_state();
         }
@@ -401,6 +427,8 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
         sidebar_slot,
         #[strong]
         cancel_active_stream,
+        #[strong]
+        select_model_for_current_context,
         move || {
             cancel_active_stream();
             *active_chat_id.borrow_mut() = None;
@@ -410,6 +438,7 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
             if let Some(sidebar) = sidebar_slot.borrow().as_ref() {
                 sidebar.clear_selection();
             }
+            select_model_for_current_context();
             input_view.grab_focus();
         }
     ));
@@ -433,6 +462,8 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
         active_chat_id,
         #[strong]
         cancel_active_stream,
+        #[strong]
+        select_model_for_current_context,
         move |chat_id: String| {
             cancel_active_stream();
             let store = chat_store.borrow();
@@ -451,6 +482,9 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
             } else {
                 "chat"
             });
+            drop(store);
+
+            select_model_for_current_context();
 
             if split_view.is_collapsed() {
                 split_view.set_show_sidebar(false);
@@ -572,9 +606,20 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
             let chat_id = {
                 let mut current = active_chat_id.borrow_mut();
                 match current.as_ref() {
-                    Some(existing) => existing.clone(),
+                    Some(existing) => {
+                        chat_store.borrow_mut().set_chat_model(
+                            existing,
+                            option.account_id.clone(),
+                            option.model.clone(),
+                        );
+                        existing.clone()
+                    }
                     None => {
-                        let new_id = chat_store.borrow_mut().create_chat(&prompt_owned);
+                        let new_id = chat_store.borrow_mut().create_chat(
+                            &prompt_owned,
+                            Some(option.account_id.clone()),
+                            Some(option.model.clone()),
+                        );
                         *current = Some(new_id.clone());
                         new_id
                     }
@@ -877,9 +922,15 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
     let preferences_action = gio::ActionEntry::builder("preferences")
         .activate({
             let settings = Rc::clone(&settings);
+            let model_options = Rc::clone(&model_options);
             let on_settings_changed = Rc::clone(&on_settings_changed);
             move |win: &adw::ApplicationWindow, _, _| {
-                present_settings_dialog(win, Rc::clone(&settings), Rc::clone(&on_settings_changed));
+                present_settings_dialog(
+                    win,
+                    Rc::clone(&settings),
+                    Rc::clone(&model_options),
+                    Rc::clone(&on_settings_changed),
+                );
             }
         })
         .build();
