@@ -320,16 +320,17 @@ pub fn build_message_row(
             bubble.add_css_class("user-bubble");
 
             if !attachments.is_empty() {
-                let att_flow = gtk::FlowBox::builder()
-                    .selection_mode(gtk::SelectionMode::None)
-                    .row_spacing(4)
-                    .column_spacing(6)
-                    .max_children_per_line(4)
+                let att_row = gtk::Box::builder()
+                    .orientation(gtk::Orientation::Horizontal)
+                    .spacing(6)
+                    .halign(gtk::Align::Start)
                     .build();
                 for att in attachments {
                     let pill = gtk::Box::builder()
                         .orientation(gtk::Orientation::Horizontal)
                         .spacing(5)
+                        .halign(gtk::Align::Start)
+                        .hexpand(false)
                         .build();
                     pill.add_css_class("user-attachment-pill");
 
@@ -347,9 +348,9 @@ pub fn build_message_row(
                     name_label.add_css_class("caption");
                     pill.append(&icon);
                     pill.append(&name_label);
-                    att_flow.insert(&pill, -1);
+                    att_row.append(&pill);
                 }
-                bubble.append(&att_flow);
+                bubble.append(&att_row);
             }
 
             if !text.trim().is_empty() {

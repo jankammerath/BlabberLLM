@@ -42,7 +42,7 @@ enum StreamChunk {
 struct ComposerWidgets {
     bar: gtk::Box,
     card: gtk::Box,
-    attachments_box: gtk::FlowBox,
+    attachments_box: gtk::Box,
     input_view: gtk::TextView,
     model_dropdown: gtk::DropDown,
     refresh_models_button: gtk::Button,
@@ -210,6 +210,8 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
                 let chip = gtk::Box::builder()
                     .orientation(gtk::Orientation::Horizontal)
                     .spacing(6)
+                    .halign(gtk::Align::Start)
+                    .hexpand(false)
                     .build();
                 chip.add_css_class("attachment-chip");
 
@@ -256,7 +258,7 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
                 chip.append(&icon);
                 chip.append(&label);
                 chip.append(&remove_btn);
-                attachments_box.insert(&chip, -1);
+                attachments_box.append(&chip);
             }
 
             update_send_button_state();
@@ -1495,12 +1497,23 @@ fn build_composer(initial_tools_enabled: bool) -> ComposerWidgets {
     composer_toolbar.append(&spacer);
     composer_toolbar.append(&send_button);
 
-    let attachments_box = gtk::FlowBox::builder()
-        .selection_mode(gtk::SelectionMode::None)
-        .row_spacing(6)
-        .column_spacing(6)
-        .max_children_per_line(6)
+    let attachments_box = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(6)
+        .halign(gtk::Align::Start)
         .visible(false)
+        .build();
+    attachments_box.add_css_class("attachments-strip");
+
+    let attachments_scroll = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Automatic)
+        .vscrollbar_policy(gtk::PolicyType::Never)
+        .propagate_natural_height(true)
+        .child(&attachments_box)
+        .build();
+    attachments_box
+        .bind_property("visible", &attachments_scroll, "visible")
+        .sync_create()
         .build();
 
     let composer_card = gtk::Box::builder()
@@ -1510,7 +1523,7 @@ fn build_composer(initial_tools_enabled: bool) -> ComposerWidgets {
         .build();
     composer_card.add_css_class("card");
     composer_card.add_css_class("composer-card");
-    composer_card.append(&attachments_box);
+    composer_card.append(&attachments_scroll);
     composer_card.append(&input_overlay);
     composer_card.append(&composer_toolbar);
 
