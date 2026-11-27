@@ -120,3 +120,30 @@
     padding: 6px 4px;
     font-size: 0.88em;
 }
+
+.markdown-table {
+    border: 1px solid color-mix(in srgb, currentColor 16%, transparent);
+    border-radius: 10px;
+    background-color: color-mix(in srgb, currentColor 4%, transparent);
+    margin-top: 6px;
+    margin-bottom: 6px;
+}
+
+.markdown-table-cell {
+    padding: 8px 14px;
+    border-top: 1px solid color-mix(in srgb, currentColor 10%, transparent);
+}
+
+.markdown-table-header {
+    border-top: none;
+    background-color: color-mix(in srgb, currentColor 8%, transparent);
+    border-bottom: 1px solid color-mix(in srgb, currentColor 16%, transparent);
+}
+
+.markdown-table-row-alt {
+    background-color: color-mix(in srgb, currentColor 3%, transparent);
+}
+
+.markdown-table-col-border {
+    border-right: 1px solid color-mix(in srgb, currentColor 10%, transparent);
+}

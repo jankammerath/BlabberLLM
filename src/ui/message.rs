@@ -91,7 +91,7 @@ pub struct StreamingMessageHandle {
     pub row: gtk::Box,
     status_label: gtk::Label,
     tools_box: gtk::Box,
-    markdown_view: gtk::TextView,
+    markdown_view: gtk::Box,
     raw_text: Rc<RefCell<String>>,
     tool_cards: RefCell<Vec<ToolCardEntry>>,
 }

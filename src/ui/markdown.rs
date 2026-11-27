@@ -1,21 +1,42 @@
 use adw::prelude::*;
 use gtk::{gdk, pango};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TableAlign {
+    Left,
+    Center,
+    Right,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum MarkdownBlock {
     Heading { level: u8, text: String },
     Paragraph(String),
     CodeBlock { language: String, code: String },
+    Table {
+        headers: Vec<String>,
+        alignments: Vec<TableAlign>,
+        rows: Vec<Vec<String>>,
+    },
     BulletList(Vec<String>),
     OrderedList(Vec<(String, String)>),
     BlockQuote(String),
     HorizontalRule,
 }
 
-/// Builds a read-only `gtk::TextView` that supports continuous text selection
-/// across the entire rendered Markdown response (headings, paragraphs, lists,
-/// blockquotes, and fenced code blocks).
-pub fn build_markdown_view() -> gtk::TextView {
+/// Builds a vertical container that renders Markdown prose runs in continuous
+/// selectable `gtk::TextView`s and tables as full-width native `gtk::Grid` widgets.
+pub fn build_markdown_view() -> gtk::Box {
+    let container = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(8)
+        .hexpand(true)
+        .build();
+    container.add_css_class("markdown-view");
+    container
+}
+
+fn build_text_view() -> gtk::TextView {
     let buffer = gtk::TextBuffer::new(None);
     register_tags(&buffer);
 
@@ -33,22 +54,50 @@ pub fn build_markdown_view() -> gtk::TextView {
     view
 }
 
-pub fn set_markdown_content(view: &gtk::TextView, markdown: &str) {
-    let buffer = view.buffer();
-    buffer.set_text("");
+fn clear_container(container: &gtk::Box) {
+    while let Some(child) = container.first_child() {
+        container.remove(&child);
+    }
+}
+
+pub fn set_markdown_content(container: &gtk::Box, markdown: &str) {
+    clear_container(container);
 
     let blocks = parse_blocks(markdown);
     if blocks.is_empty() {
-        buffer.set_text(markdown);
+        let view = build_text_view();
+        view.buffer().set_text(markdown);
+        container.append(&view);
         return;
     }
 
-    let mut iter = buffer.end_iter();
+    let mut current_view: Option<gtk::TextView> = None;
+    let mut current_has_content = false;
 
-    for (idx, block) in blocks.iter().enumerate() {
-        if idx > 0 {
+    for block in &blocks {
+        if let MarkdownBlock::Table {
+            headers,
+            alignments,
+            rows,
+        } = block
+        {
+            if let Some(view) = current_view.take() {
+                container.append(&view);
+                current_has_content = false;
+            }
+            if let Some(table_widget) = build_table_widget(headers, alignments, rows) {
+                container.append(&table_widget);
+            }
+            continue;
+        }
+
+        let view = current_view.get_or_insert_with(build_text_view);
+        let buffer = view.buffer();
+        let mut iter = buffer.end_iter();
+        if current_has_content {
             buffer.insert(&mut iter, "\n");
         }
+        current_has_content = true;
 
         match block {
             MarkdownBlock::Heading { level, text } => {
@@ -77,6 +126,7 @@ pub fn set_markdown_content(view: &gtk::TextView, markdown: &str) {
                 let s = buffer.iter_at_offset(start_offset);
                 buffer.apply_tag_by_name("code_block", &s, &iter);
             }
+            MarkdownBlock::Table { .. } => unreachable!(),
             MarkdownBlock::BulletList(items) => {
                 for (item_idx, item) in items.iter().enumerate() {
                     if item_idx > 0 {
@@ -118,18 +168,28 @@ pub fn set_markdown_content(view: &gtk::TextView, markdown: &str) {
             }
         }
     }
+
+    if let Some(view) = current_view {
+        container.append(&view);
+    }
 }
 
-pub fn set_plain_dim_content(view: &gtk::TextView, text: &str) {
+pub fn set_plain_dim_content(container: &gtk::Box, text: &str) {
+    clear_container(container);
+    let view = build_text_view();
     let buffer = view.buffer();
     buffer.set_text(text);
     let start = buffer.start_iter();
     let end = buffer.end_iter();
     buffer.apply_tag_by_name("dim", &start, &end);
+    container.append(&view);
 }
 
-pub fn set_plain_content(view: &gtk::TextView, text: &str) {
+pub fn set_plain_content(container: &gtk::Box, text: &str) {
+    clear_container(container);
+    let view = build_text_view();
     view.buffer().set_text(text);
+    container.append(&view);
 }
 
 fn register_tags(buffer: &gtk::TextBuffer) {
@@ -202,6 +262,104 @@ fn register_tags(buffer: &gtk::TextBuffer) {
     tag_table.add(&dim_tag);
 }
 
+fn build_table_widget(
+    headers: &[String],
+    alignments: &[TableAlign],
+    rows: &[Vec<String>],
+) -> Option<gtk::Box> {
+    let col_count = headers
+        .len()
+        .max(rows.iter().map(Vec::len).max().unwrap_or(0));
+    if col_count == 0 {
+        return None;
+    }
+
+    let grid = gtk::Grid::builder()
+        .row_spacing(0)
+        .column_spacing(0)
+        .hexpand(true)
+        .halign(gtk::Align::Fill)
+        .build();
+    grid.add_css_class("markdown-table-grid");
+
+    // Header row
+    for c in 0..col_count {
+        let cell_text = headers.get(c).map(String::as_str).unwrap_or("");
+        let align = alignments.get(c).copied().unwrap_or(TableAlign::Left);
+        let cell = build_table_cell(cell_text, align, true, false, c + 1 == col_count);
+        grid.attach(&cell, c as i32, 0, 1, 1);
+    }
+
+    // Body rows
+    for (r_idx, row) in rows.iter().enumerate() {
+        let is_alt = r_idx % 2 == 1;
+        for c in 0..col_count {
+            let cell_text = row.get(c).map(String::as_str).unwrap_or("");
+            let align = alignments.get(c).copied().unwrap_or(TableAlign::Left);
+            let cell = build_table_cell(cell_text, align, false, is_alt, c + 1 == col_count);
+            grid.attach(&cell, c as i32, (r_idx + 1) as i32, 1, 1);
+        }
+    }
+
+    let frame = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .hexpand(true)
+        .halign(gtk::Align::Fill)
+        .overflow(gtk::Overflow::Hidden)
+        .build();
+    frame.add_css_class("markdown-table");
+    frame.append(&grid);
+
+    Some(frame)
+}
+
+fn build_table_cell(
+    text: &str,
+    align: TableAlign,
+    is_header: bool,
+    is_alt_row: bool,
+    is_last_col: bool,
+) -> gtk::Box {
+    let xalign = match align {
+        TableAlign::Left => 0.0,
+        TableAlign::Center => 0.5,
+        TableAlign::Right => 1.0,
+    };
+
+    let markup = if is_header {
+        format!("<b>{}</b>", inline_to_pango(text))
+    } else {
+        inline_to_pango(text)
+    };
+
+    let label = gtk::Label::builder()
+        .use_markup(true)
+        .wrap(true)
+        .wrap_mode(pango::WrapMode::WordChar)
+        .selectable(true)
+        .xalign(xalign)
+        .hexpand(true)
+        .build();
+    label.set_markup(&markup);
+
+    let cell = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .hexpand(true)
+        .valign(gtk::Align::Fill)
+        .build();
+    cell.add_css_class("markdown-table-cell");
+    if is_header {
+        cell.add_css_class("markdown-table-header");
+    } else if is_alt_row {
+        cell.add_css_class("markdown-table-row-alt");
+    }
+    if !is_last_col {
+        cell.add_css_class("markdown-table-col-border");
+    }
+    cell.append(&label);
+    cell
+}
+
 fn format_heading_markup(level: u8, text: &str) -> String {
     let inner = inline_to_pango(text);
     let size = match level {
@@ -263,6 +421,28 @@ fn parse_blocks(input: &str) -> Vec<MarkdownBlock> {
             continue;
         }
 
+        // Markdown table
+        if is_table_start(&lines, i) {
+            let headers = split_table_row(lines[i]);
+            let alignments = parse_table_alignments(lines[i + 1]);
+            i += 2;
+            let mut rows = Vec::new();
+            while i < lines.len() {
+                let t = lines[i].trim();
+                if t.is_empty() || !t.contains('|') || t.starts_with("```") {
+                    break;
+                }
+                rows.push(split_table_row(t));
+                i += 1;
+            }
+            blocks.push(MarkdownBlock::Table {
+                headers,
+                alignments,
+                rows,
+            });
+            continue;
+        }
+
         // Blockquote
         if trimmed.starts_with('>') {
             let mut quote_lines = Vec::new();
@@ -317,6 +497,7 @@ fn parse_blocks(input: &str) -> Vec<MarkdownBlock> {
                 || t.starts_with("```")
                 || is_horizontal_rule(t)
                 || parse_heading(t).is_some()
+                || is_table_start(&lines, i)
                 || t.starts_with('>')
                 || parse_bullet_item(t).is_some()
                 || parse_ordered_item(t).is_some()
@@ -332,6 +513,57 @@ fn parse_blocks(input: &str) -> Vec<MarkdownBlock> {
     }
 
     blocks
+}
+
+fn is_table_start(lines: &[&str], idx: usize) -> bool {
+    if idx + 1 >= lines.len() {
+        return false;
+    }
+    let header = lines[idx].trim();
+    let sep = lines[idx + 1].trim();
+    header.contains('|') && is_table_separator(sep)
+}
+
+fn is_table_separator(line: &str) -> bool {
+    if !line.contains('|') || !line.contains('-') {
+        return false;
+    }
+    let cells = split_table_row(line);
+    !cells.is_empty()
+        && cells.iter().all(|cell| {
+            let t = cell.trim();
+            !t.is_empty()
+                && t.contains('-')
+                && t.chars().all(|c| c == '-' || c == ':')
+        })
+}
+
+fn split_table_row(line: &str) -> Vec<String> {
+    let trimmed = line.trim();
+    let inner = trimmed
+        .strip_prefix('|')
+        .unwrap_or(trimmed);
+    let inner = inner.strip_suffix('|').unwrap_or(inner);
+    inner
+        .split('|')
+        .map(|cell| cell.trim().to_string())
+        .collect()
+}
+
+fn parse_table_alignments(line: &str) -> Vec<TableAlign> {
+    split_table_row(line)
+        .into_iter()
+        .map(|cell| {
+            let t = cell.trim();
+            let left = t.starts_with(':');
+            let right = t.ends_with(':');
+            match (left, right) {
+                (true, true) => TableAlign::Center,
+                (false, true) => TableAlign::Right,
+                _ => TableAlign::Left,
+            }
+        })
+        .collect()
 }
 
 fn is_horizontal_rule(line: &str) -> bool {
@@ -549,5 +781,25 @@ mod tests {
                 code: "fn main() {}".into()
             }
         );
+    }
+
+    #[test]
+    fn parses_markdown_tables() {
+        let md = "Intro\n| Setting | Before | Now |\n|---|---:|:---:|\n| Lock | on | off |\n| Blank | 300s | 0 |\n\nOutro";
+        let blocks = parse_blocks(md);
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(blocks[0], MarkdownBlock::Paragraph("Intro".into()));
+        assert_eq!(
+            blocks[1],
+            MarkdownBlock::Table {
+                headers: vec!["Setting".into(), "Before".into(), "Now".into()],
+                alignments: vec![TableAlign::Left, TableAlign::Right, TableAlign::Center],
+                rows: vec![
+                    vec!["Lock".into(), "on".into(), "off".into()],
+                    vec!["Blank".into(), "300s".into(), "0".into()],
+                ],
+            }
+        );
+        assert_eq!(blocks[2], MarkdownBlock::Paragraph("Outro".into()));
     }
 }
