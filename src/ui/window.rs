@@ -3,7 +3,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use adw::prelude::*;
 use gtk::{gdk, gio, glib};
@@ -474,7 +474,12 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
             *active_chat_id.borrow_mut() = Some(chat.id.clone());
             clear_box(&messages_box);
             for msg in &chat.messages {
-                messages_box.append(&build_message_row(msg.role, &msg.content, &msg.tool_calls));
+                messages_box.append(&build_message_row(
+                    msg.role,
+                    &msg.content,
+                    &msg.tool_calls,
+                    msg.duration_ms,
+                ));
             }
             title.set_title(&chat.title);
             content_stack.set_visible_child_name(if chat.messages.is_empty() {
@@ -640,11 +645,13 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
             };
 
             content_stack.set_visible_child_name("chat");
-            messages_box.append(&build_message_row(MessageRole::User, &prompt_owned, &[]));
+            messages_box.append(&build_message_row(MessageRole::User, &prompt_owned, &[], None));
 
-            let assistant_handle = build_streaming_assistant_row(&option.display_label());
+            let assistant_handle = build_streaming_assistant_row();
             messages_box.append(&assistant_handle.row);
             scroll_to_bottom(&scrolled_window);
+
+            let started_at = Instant::now();
 
             let cancel_flag = Arc::new(AtomicBool::new(false));
             *active_stream_cancel.borrow_mut() = Some(Arc::clone(&cancel_flag));
@@ -819,6 +826,7 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
 
                                     match result {
                                         Ok(final_text) => {
+                                            let elapsed_ms = started_at.elapsed().as_millis() as u64;
                                             let tools_snapshot = recorded_tools.borrow().clone();
                                             if !final_text.trim().is_empty()
                                                 || !tools_snapshot.is_empty()
@@ -829,6 +837,7 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
                                                     MessageRole::Assistant,
                                                     final_text.clone(),
                                                     tools_snapshot,
+                                                    Some(elapsed_ms),
                                                 );
                                                 let current_active = active_chat_id_clone.borrow();
                                                 sidebar_clone.refresh(
@@ -836,6 +845,7 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
                                                     current_active.as_deref(),
                                                 );
                                                 if still_viewing {
+                                                    assistant_handle.set_finished_elapsed(elapsed_ms);
                                                     if !final_text.trim().is_empty() {
                                                         assistant_handle.set_content(&final_text);
                                                     } else {
@@ -844,6 +854,7 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
                                                     scroll_to_bottom(&scrolled_window);
                                                 }
                                             } else if still_viewing {
+                                                assistant_handle.set_finished_elapsed(elapsed_ms);
                                                 if cancel_flag.load(Ordering::Relaxed) {
                                                     assistant_handle
                                                         .set_plain_status("Generation stopped.");
@@ -868,12 +879,16 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
                                     return glib::ControlFlow::Break;
                                 }
                                 Err(mpsc::TryRecvError::Empty) => {
-                                    if text_changed
-                                        && active_chat_id_clone.borrow().as_deref()
-                                            == Some(chat_id_for_stream.as_str())
+                                    if active_chat_id_clone.borrow().as_deref()
+                                        == Some(chat_id_for_stream.as_str())
                                     {
-                                        assistant_handle.set_content(&accumulated.borrow());
-                                        scroll_to_bottom(&scrolled_window);
+                                        assistant_handle.set_working_elapsed(
+                                            started_at.elapsed().as_millis() as u64,
+                                        );
+                                        if text_changed {
+                                            assistant_handle.set_content(&accumulated.borrow());
+                                            scroll_to_bottom(&scrolled_window);
+                                        }
                                     }
                                     return glib::ControlFlow::Continue;
                                 }

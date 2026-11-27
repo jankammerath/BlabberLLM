@@ -20,6 +20,7 @@ pub struct ChatMessage {
     pub role: MessageRole,
     pub content: String,
     pub tool_calls: Vec<ToolCallRecord>,
+    pub duration_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -133,7 +134,7 @@ impl ChatStore {
     }
 
     pub fn append_message(&mut self, chat_id: &str, role: MessageRole, content: String) {
-        self.append_message_with_tools(chat_id, role, content, Vec::new());
+        self.append_message_with_tools(chat_id, role, content, Vec::new(), None);
     }
 
     pub fn append_message_with_tools(
@@ -142,6 +143,7 @@ impl ChatStore {
         role: MessageRole,
         content: String,
         tool_calls: Vec<ToolCallRecord>,
+        duration_ms: Option<u64>,
     ) {
         let Some(pos) = self.chats.iter().position(|c| c.id == chat_id) else {
             return;
@@ -152,6 +154,7 @@ impl ChatStore {
             role,
             content,
             tool_calls,
+            duration_ms,
         });
         chat.updated_at = unix_timestamp_secs();
         self.chats.insert(0, chat);
@@ -196,6 +199,9 @@ impl ChatStore {
             let group = format!("message.{idx}");
             key_file.set_string(&group, "role", msg.role.as_str());
             key_file.set_string(&group, "content", &msg.content);
+            if let Some(ms) = msg.duration_ms {
+                key_file.set_uint64(&group, "duration_ms", ms);
+            }
             if !msg.tool_calls.is_empty() {
                 key_file.set_uint64(&group, "tool_count", msg.tool_calls.len() as u64);
                 for (t_idx, tool) in msg.tool_calls.iter().enumerate() {
@@ -260,6 +266,7 @@ fn load_chat_file(path: &Path) -> Option<ChatSession> {
             .string(&group, "content")
             .map(|s| s.to_string())
             .unwrap_or_default();
+        let duration_ms = key_file.uint64(&group, "duration_ms").ok();
 
         let tool_count = key_file.uint64(&group, "tool_count").unwrap_or(0) as usize;
         let mut tool_calls = Vec::with_capacity(tool_count);
@@ -296,6 +303,7 @@ fn load_chat_file(path: &Path) -> Option<ChatSession> {
             role,
             content,
             tool_calls,
+            duration_ms,
         });
     }
 
@@ -362,6 +370,7 @@ mod tests {
                 output: "file1\nfile2".into(),
                 denied: false,
             }],
+            Some(4250),
         );
         store.set_chat_model(&id, "provider-2".into(), "gpt-4o".into());
 
@@ -376,6 +385,7 @@ mod tests {
         assert_eq!(chat.messages[0].content, "Hello\nsecond line");
         assert_eq!(chat.messages[1].role, MessageRole::Assistant);
         assert_eq!(chat.messages[1].content, "Hi there!");
+        assert_eq!(chat.messages[1].duration_ms, Some(4250));
         assert_eq!(chat.messages[1].tool_calls.len(), 1);
         assert_eq!(chat.messages[1].tool_calls[0].command, "ls -la");
         assert_eq!(chat.messages[1].tool_calls[0].exit_code, Some(0));

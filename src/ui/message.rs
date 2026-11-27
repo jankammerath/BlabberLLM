@@ -33,6 +33,54 @@ impl MessageRole {
     }
 }
 
+pub fn format_worked_duration(duration_ms: u64) -> String {
+    let total_secs = duration_ms / 1000;
+    if total_secs == 0 {
+        return "Worked for <1s".to_string();
+    }
+    if total_secs < 60 {
+        return format!("Worked for {total_secs}s");
+    }
+    let total_mins = total_secs / 60;
+    let rem_secs = total_secs % 60;
+    if total_mins < 60 {
+        if rem_secs == 0 {
+            if total_mins == 1 {
+                "Worked for 1 min".to_string()
+            } else {
+                format!("Worked for {total_mins} mins")
+            }
+        } else {
+            format!("Worked for {total_mins}m {rem_secs}s")
+        }
+    } else {
+        let hours = total_mins / 60;
+        let rem_mins = total_mins % 60;
+        if rem_mins == 0 {
+            if hours == 1 {
+                "Worked for 1 hr".to_string()
+            } else {
+                format!("Worked for {hours} hrs")
+            }
+        } else {
+            format!("Worked for {hours}h {rem_mins}m")
+        }
+    }
+}
+
+pub fn format_working_duration(duration_ms: u64) -> String {
+    let total_secs = duration_ms / 1000;
+    if total_secs == 0 {
+        "Working…".to_string()
+    } else if total_secs < 60 {
+        format!("Working… ({total_secs}s)")
+    } else {
+        let mins = total_secs / 60;
+        let secs = total_secs % 60;
+        format!("Working… ({mins}m {secs}s)")
+    }
+}
+
 struct ToolCardEntry {
     command: String,
     status_label: gtk::Label,
@@ -41,7 +89,7 @@ struct ToolCardEntry {
 
 pub struct StreamingMessageHandle {
     pub row: gtk::Box,
-    role_label: gtk::Label,
+    status_label: gtk::Label,
     tools_box: gtk::Box,
     markdown_view: gtk::TextView,
     raw_text: Rc<RefCell<String>>,
@@ -57,6 +105,16 @@ impl StreamingMessageHandle {
     pub fn set_plain_status(&self, text: &str) {
         *self.raw_text.borrow_mut() = text.to_string();
         set_plain_dim_content(&self.markdown_view, text);
+    }
+
+    pub fn set_working_elapsed(&self, duration_ms: u64) {
+        self.status_label
+            .set_label(&format_working_duration(duration_ms));
+    }
+
+    pub fn set_finished_elapsed(&self, duration_ms: u64) {
+        self.status_label
+            .set_label(&format_worked_duration(duration_ms));
     }
 
     pub fn add_tool_started(&self, command: &str, working_dir: Option<&str>) {
@@ -90,9 +148,9 @@ impl StreamingMessageHandle {
     }
 
     pub fn set_error(&self, message: &str) {
-        self.role_label.remove_css_class("dim-label");
-        self.role_label.add_css_class("error");
-        self.role_label.set_label("Error");
+        self.status_label.remove_css_class("dim-label");
+        self.status_label.add_css_class("error");
+        self.status_label.set_label("Error");
         *self.raw_text.borrow_mut() = message.to_string();
         set_plain_content(&self.markdown_view, message);
     }
@@ -234,23 +292,23 @@ pub fn build_message_row(
     role: MessageRole,
     text: &str,
     tool_calls: &[ToolCallRecord],
+    duration_ms: Option<u64>,
 ) -> gtk::Box {
     let row = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .hexpand(true)
         .build();
 
-    let bubble = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .spacing(6)
-        .hexpand(true)
-        .build();
-    bubble.add_css_class("message-bubble");
-
     match role {
         MessageRole::User => {
-            bubble.set_halign(gtk::Align::End);
-            bubble.set_margin_start(64);
+            let bubble = gtk::Box::builder()
+                .orientation(gtk::Orientation::Vertical)
+                .spacing(6)
+                .hexpand(true)
+                .halign(gtk::Align::End)
+                .margin_start(64)
+                .build();
+            bubble.add_css_class("message-bubble");
             bubble.add_css_class("user-bubble");
 
             let content_label = gtk::Label::builder()
@@ -261,32 +319,36 @@ pub fn build_message_row(
                 .xalign(0.0)
                 .build();
             bubble.append(&content_label);
+            row.append(&bubble);
         }
         MessageRole::Assistant => {
-            bubble.set_halign(gtk::Align::Start);
-            bubble.set_margin_end(64);
-            bubble.add_css_class("card");
-            bubble.add_css_class("assistant-bubble");
+            let container = gtk::Box::builder()
+                .orientation(gtk::Orientation::Vertical)
+                .spacing(6)
+                .hexpand(true)
+                .build();
+            container.add_css_class("assistant-response");
 
             let header = gtk::Box::builder()
                 .orientation(gtk::Orientation::Horizontal)
                 .spacing(6)
                 .build();
 
-            let role_label = gtk::Label::builder()
-                .label("Assistant")
+            let status_text = duration_ms.map(format_worked_duration).unwrap_or_default();
+            let status_label = gtk::Label::builder()
+                .label(&status_text)
                 .xalign(0.0)
                 .hexpand(true)
                 .build();
-            role_label.add_css_class("dim-label");
-            role_label.add_css_class("message-role");
+            status_label.add_css_class("dim-label");
+            status_label.add_css_class("message-role");
 
             let raw_text = Rc::new(RefCell::new(text.to_string()));
             let copy_button = build_copy_button(raw_text);
 
-            header.append(&role_label);
+            header.append(&status_label);
             header.append(&copy_button);
-            bubble.append(&header);
+            container.append(&header);
 
             if !tool_calls.is_empty() {
                 let tools_box = gtk::Box::builder()
@@ -304,74 +366,71 @@ pub fn build_message_row(
                     apply_tool_status_style(&entry.status_label, tool.exit_code, tool.denied);
                     tools_box.append(&entry.container);
                 }
-                bubble.append(&tools_box);
+                container.append(&tools_box);
             }
 
             if !text.trim().is_empty() {
                 let markdown_view = build_markdown_view();
                 set_markdown_content(&markdown_view, text);
-                bubble.append(&markdown_view);
+                container.append(&markdown_view);
             }
+
+            row.append(&container);
         }
     }
 
-    row.append(&bubble);
     row
 }
 
-pub fn build_streaming_assistant_row(model_label: &str) -> StreamingMessageHandle {
+pub fn build_streaming_assistant_row() -> StreamingMessageHandle {
     let row = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .hexpand(true)
         .build();
 
-    let bubble = gtk::Box::builder()
+    let container = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(6)
         .hexpand(true)
         .build();
-    bubble.add_css_class("message-bubble");
-    bubble.set_halign(gtk::Align::Start);
-    bubble.set_margin_end(64);
-    bubble.add_css_class("card");
-    bubble.add_css_class("assistant-bubble");
+    container.add_css_class("assistant-response");
 
     let header = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(6)
         .build();
 
-    let role_label = gtk::Label::builder()
-        .label(model_label)
+    let status_label = gtk::Label::builder()
+        .label("Working…")
         .xalign(0.0)
         .hexpand(true)
         .ellipsize(pango::EllipsizeMode::End)
         .build();
-    role_label.add_css_class("dim-label");
-    role_label.add_css_class("message-role");
+    status_label.add_css_class("dim-label");
+    status_label.add_css_class("message-role");
 
     let raw_text = Rc::new(RefCell::new(String::new()));
     let copy_button = build_copy_button(Rc::clone(&raw_text));
 
-    header.append(&role_label);
+    header.append(&status_label);
     header.append(&copy_button);
-    bubble.append(&header);
+    container.append(&header);
 
     let tools_box = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(6)
         .visible(false)
         .build();
-    bubble.append(&tools_box);
+    container.append(&tools_box);
 
     let markdown_view = build_markdown_view();
-    bubble.append(&markdown_view);
+    container.append(&markdown_view);
 
-    row.append(&bubble);
+    row.append(&container);
 
     let handle = StreamingMessageHandle {
         row,
-        role_label,
+        status_label,
         tools_box,
         markdown_view,
         raw_text,
@@ -379,4 +438,18 @@ pub fn build_streaming_assistant_row(model_label: &str) -> StreamingMessageHandl
     };
     handle.set_plain_status("Thinking…");
     handle
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn formats_worked_durations() {
+        assert_eq!(format_worked_duration(400), "Worked for <1s");
+        assert_eq!(format_worked_duration(4_200), "Worked for 4s");
+        assert_eq!(format_worked_duration(60_000), "Worked for 1 min");
+        assert_eq!(format_worked_duration(180_000), "Worked for 3 mins");
+        assert_eq!(format_worked_duration(125_000), "Worked for 2m 5s");
+    }
 }
