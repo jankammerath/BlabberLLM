@@ -45,9 +45,7 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
     header_bar.pack_end(&settings_button);
 
     let status_page = adw::StatusPage::builder()
-        .icon_name("chat-message-new-symbolic")
-        .title("BlabberLLM")
-        .description("Type a message below to start chatting, or open Settings to configure provider endpoints and API keys.")
+        .title("Where do we start?")
         .vexpand(true)
         .build();
 

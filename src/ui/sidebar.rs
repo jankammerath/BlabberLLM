@@ -40,7 +40,6 @@ impl SidebarView {
             .build();
 
         let empty_page = adw::StatusPage::builder()
-            .icon_name("chat-message-new-symbolic")
             .title("No Chats Yet")
             .description("Previous conversations will appear here.")
             .vexpand(true)
