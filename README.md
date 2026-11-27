@@ -2,11 +2,10 @@
 
 A lightweight, native GTK4 & Libadwaita LLM chat client for GNOME, written in Rust. Designed to look and feel at home on Debian 13 and GNOME desktops while working with both cloud LLM providers and local open-weight models through Ollama.
 
-## Screenshots
+## 
 
-| Chat Window | Shell Tool Execution |
-| --- | --- |
-| ![Basic system information](screenshots/chat-window.png) | ![Changing GNOME keyboard layout](screenshots/tool-action.png) |
+![Basic system information](screenshots/chat-window.png)
+![Changing GNOME keyboard layout](screenshots/tool-action.png)
 
 ## Features
 
