@@ -192,7 +192,11 @@ fn build_tool_card(
         .spacing(8)
         .build();
 
-    let icon = gtk::Image::from_icon_name("utilities-terminal-symbolic");
+    let icon = gtk::Image::builder()
+        .icon_name("utilities-terminal-symbolic")
+        .valign(gtk::Align::Start)
+        .margin_top(2)
+        .build();
     icon.add_css_class("dim-label");
 
     let cmd_text = if let Some(dir) = working_dir {
@@ -210,7 +214,10 @@ fn build_tool_card(
     cmd_label.add_css_class("monospace");
     cmd_label.add_css_class("caption");
 
-    let status_label = gtk::Label::builder().label(status).build();
+    let status_label = gtk::Label::builder()
+        .label(status)
+        .valign(gtk::Align::Start)
+        .build();
     status_label.add_css_class("caption");
     status_label.add_css_class("dim-label");
 
