@@ -1,6 +1,6 @@
 [package]
 name = "blabber-llm"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 rust-version = "1.85"
 description = "An open GTK4 LLM chat GUI for GNOME following Adwaita design"
