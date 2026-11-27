@@ -37,9 +37,8 @@ sudo dnf install ./blabber-llm-aarch64.rpm
 
 ## Screenshots
 
-| Chat Window | Shell Tool Execution |
-| --- | --- |
-| ![Basic system information](screenshots/chat-window.png) | ![Changing GNOME keyboard layout](screenshots/tool-action.png) |
+![Basic system information](screenshots/chat-window.png)
+![Changing GNOME keyboard layout](screenshots/tool-action.png)
 
 ## Features
 
