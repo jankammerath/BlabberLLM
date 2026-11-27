@@ -601,6 +601,7 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
                 let cfg = ShellToolConfig {
                     enabled: guard.shell_tool_enabled(),
                     permission_mode: guard.shell_permission_mode(),
+                    sudo_enabled: guard.shell_sudo_enabled(),
                 };
                 (acc, cfg)
             };
@@ -999,13 +1000,17 @@ fn present_shell_approval_dialog(
     request: &ShellToolRequest,
     reply_tx: mpsc::Sender<bool>,
 ) {
-    let heading = if request.dangerous {
+    let heading = if request.elevated {
+        "Allow Administrator (sudo) Command?"
+    } else if request.dangerous {
         "Allow Potentially Dangerous Command?"
     } else {
         "Allow Shell Command?"
     };
 
-    let mut body = if request.dangerous {
+    let mut body = if request.elevated {
+        "The assistant wants to run this command with administrator privileges. You will also be prompted by the system to authenticate:".to_string()
+    } else if request.dangerous {
         "The assistant wants to run a command that may modify files or system state:".to_string()
     } else {
         "The assistant wants to run the following shell command:".to_string()
@@ -1038,10 +1043,15 @@ fn present_shell_approval_dialog(
         .close_response("deny")
         .build();
 
-    dialog.add_responses(&[("deny", "Deny"), ("allow", "Allow")]);
+    let allow_label = if request.elevated {
+        "Allow with sudo"
+    } else {
+        "Allow"
+    };
+    dialog.add_responses(&[("deny", "Deny"), ("allow", allow_label)]);
     dialog.set_response_appearance(
         "allow",
-        if request.dangerous {
+        if request.dangerous || request.elevated {
             adw::ResponseAppearance::Destructive
         } else {
             adw::ResponseAppearance::Suggested

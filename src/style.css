@@ -14,7 +14,7 @@
 }
 
 .assistant-response {
-    padding: 4px 2px 8px 2px;
+    padding: 6px 2px 14px 2px;
 }
 
 .message-role {
@@ -71,6 +71,10 @@
 .markdown-view,
 .markdown-view text {
     background: transparent;
+}
+
+.markdown-view {
+    margin-top: 6px;
 }
 
 .markdown-list {

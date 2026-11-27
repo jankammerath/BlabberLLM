@@ -31,6 +31,7 @@ impl ModelOption {
 pub struct ShellToolConfig {
     pub enabled: bool,
     pub permission_mode: ShellPermissionMode,
+    pub sudo_enabled: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -38,6 +39,7 @@ pub struct ShellToolRequest {
     pub command: String,
     pub working_directory: Option<String>,
     pub dangerous: bool,
+    pub elevated: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -248,7 +250,7 @@ where
             base,
             model,
             &conv,
-            tool_config.enabled,
+            tool_config,
             cancel,
             |delta| {
                 if !emitted_separator && turn > 0 && !accumulated_text.is_empty() {
@@ -273,7 +275,7 @@ where
             }
             let result_text = execute_tool_call(
                 &call,
-                tool_config.permission_mode,
+                tool_config,
                 &mut on_event,
                 &mut request_approval,
             );
@@ -292,7 +294,7 @@ where
 
 fn execute_tool_call<FEvent, FApprove>(
     call: &PendingToolCall,
-    permission_mode: ShellPermissionMode,
+    tool_config: &ShellToolConfig,
     on_event: &mut FEvent,
     request_approval: &mut FApprove,
 ) -> String
@@ -305,7 +307,7 @@ where
     }
 
     let args = call.parsed_args();
-    let command = args
+    let raw_command = args
         .get("command")
         .and_then(Value::as_str)
         .unwrap_or("")
@@ -317,13 +319,33 @@ where
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(ToString::to_string);
+    let arg_sudo = args.get("sudo").and_then(Value::as_bool).unwrap_or(false);
 
-    if command.is_empty() {
+    if raw_command.is_empty() {
         return "Error: missing required 'command' parameter.".to_string();
     }
 
-    let dangerous = is_dangerous_command(&command);
-    let needs_approval = match permission_mode {
+    let stripped_sudo = tools::strip_leading_sudo(&raw_command).map(ToString::to_string);
+    let wants_sudo = arg_sudo || stripped_sudo.is_some();
+    let exec_command = stripped_sudo.unwrap_or_else(|| raw_command.clone());
+    let display_command = if wants_sudo {
+        format!("sudo {exec_command}")
+    } else {
+        exec_command.clone()
+    };
+
+    if wants_sudo && !tool_config.sudo_enabled {
+        on_event(ChatStreamEvent::ToolFinished {
+            command: display_command,
+            exit_code: None,
+            output: "Administrator (sudo) commands are disabled in Settings.".to_string(),
+            denied: true,
+        });
+        return "Elevated (sudo) commands are disabled in BlabberLLM Settings. Ask the user to enable 'Allow Elevated Commands (sudo)' in Settings if administrator privileges are needed.".to_string();
+    }
+
+    let dangerous = wants_sudo || is_dangerous_command(&exec_command);
+    let needs_approval = match tool_config.permission_mode {
         ShellPermissionMode::AlwaysAsk => true,
         ShellPermissionMode::AskWhenDangerous => dangerous,
         ShellPermissionMode::NeverAsk => false,
@@ -331,13 +353,14 @@ where
 
     if needs_approval {
         let req = ShellToolRequest {
-            command: command.clone(),
+            command: display_command.clone(),
             working_directory: working_directory.clone(),
             dangerous,
+            elevated: wants_sudo,
         };
         if !request_approval(&req) {
             on_event(ChatStreamEvent::ToolFinished {
-                command,
+                command: display_command,
                 exit_code: None,
                 output: "Permission denied by user.".to_string(),
                 denied: true,
@@ -347,13 +370,14 @@ where
     }
 
     on_event(ChatStreamEvent::ToolStarted {
-        command: command.clone(),
+        command: display_command.clone(),
         working_directory: working_directory.clone(),
     });
 
-    let exec_result = tools::execute_shell_command(&command, working_directory.as_deref());
+    let exec_result =
+        tools::execute_shell_command(&exec_command, working_directory.as_deref(), wants_sudo);
     on_event(ChatStreamEvent::ToolFinished {
-        command,
+        command: display_command,
         exit_code: Some(exec_result.exit_code),
         output: exec_result.combined_preview(),
         denied: false,
@@ -523,67 +547,100 @@ fn append_tool_turn(
     }
 }
 
-fn openai_shell_tool_schema() -> Value {
+fn openai_shell_tool_schema(sudo_enabled: bool) -> Value {
+    let mut properties = json!({
+        "command": {
+            "type": "string",
+            "description": "The bash command to execute."
+        },
+        "working_directory": {
+            "type": "string",
+            "description": "Optional working directory path."
+        }
+    });
+    let description = if sudo_enabled {
+        properties["sudo"] = json!({
+            "type": "boolean",
+            "description": "Set to true to execute with administrator (root) privileges via system authentication (pkexec)."
+        });
+        "Execute a shell command using bash on the user's Linux system and return exit code, stdout, and stderr. Set sudo=true when administrator privileges are required."
+    } else {
+        "Execute a shell command using bash on the user's Linux system and return exit code, stdout, and stderr."
+    };
+
     json!({
         "type": "function",
         "function": {
             "name": SHELL_TOOL_NAME,
-            "description": "Execute a shell command using bash on the user's Linux system and return exit code, stdout, and stderr.",
+            "description": description,
             "parameters": {
                 "type": "object",
-                "properties": {
-                    "command": {
-                        "type": "string",
-                        "description": "The bash command to execute."
-                    },
-                    "working_directory": {
-                        "type": "string",
-                        "description": "Optional working directory path."
-                    }
-                },
+                "properties": properties,
                 "required": ["command"]
             }
         }
     })
 }
 
-fn claude_shell_tool_schema() -> Value {
+fn claude_shell_tool_schema(sudo_enabled: bool) -> Value {
+    let mut properties = json!({
+        "command": {
+            "type": "string",
+            "description": "The bash command to execute."
+        },
+        "working_directory": {
+            "type": "string",
+            "description": "Optional working directory path."
+        }
+    });
+    let description = if sudo_enabled {
+        properties["sudo"] = json!({
+            "type": "boolean",
+            "description": "Set to true to execute with administrator (root) privileges via system authentication (pkexec)."
+        });
+        "Execute a shell command using bash on the user's Linux system and return exit code, stdout, and stderr. Set sudo=true when administrator privileges are required."
+    } else {
+        "Execute a shell command using bash on the user's Linux system and return exit code, stdout, and stderr."
+    };
+
     json!({
         "name": SHELL_TOOL_NAME,
-        "description": "Execute a shell command using bash on the user's Linux system and return exit code, stdout, and stderr.",
+        "description": description,
         "input_schema": {
             "type": "object",
-            "properties": {
-                "command": {
-                    "type": "string",
-                    "description": "The bash command to execute."
-                },
-                "working_directory": {
-                    "type": "string",
-                    "description": "Optional working directory path."
-                }
-            },
+            "properties": properties,
             "required": ["command"]
         }
     })
 }
 
-fn gemini_shell_tool_schema() -> Value {
+fn gemini_shell_tool_schema(sudo_enabled: bool) -> Value {
+    let mut properties = json!({
+        "command": {
+            "type": "STRING",
+            "description": "The bash command to execute."
+        },
+        "working_directory": {
+            "type": "STRING",
+            "description": "Optional working directory path."
+        }
+    });
+    let description = if sudo_enabled {
+        properties["sudo"] = json!({
+            "type": "BOOLEAN",
+            "description": "Set to true to execute with administrator (root) privileges via system authentication (pkexec)."
+        });
+        "Execute a shell command using bash on the user's Linux system and return exit code, stdout, and stderr. Set sudo=true when administrator privileges are required."
+    } else {
+        "Execute a shell command using bash on the user's Linux system and return exit code, stdout, and stderr."
+    };
+
     json!({
         "name": SHELL_TOOL_NAME,
-        "description": "Execute a shell command using bash on the user's Linux system and return exit code, stdout, and stderr.",
+        "description": description,
         "parameters": {
             "type": "OBJECT",
-            "properties": {
-                "command": {
-                    "type": "STRING",
-                    "description": "The bash command to execute."
-                },
-                "working_directory": {
-                    "type": "STRING",
-                    "description": "Optional working directory path."
-                }
-            },
+            "properties": properties,
             "required": ["command"]
         }
     })
@@ -596,13 +653,15 @@ fn run_single_turn<F>(
     base: &str,
     model: &str,
     conv: &[Value],
-    tools_enabled: bool,
+    tool_config: &ShellToolConfig,
     cancel: &AtomicBool,
     mut on_delta: F,
 ) -> Result<Vec<PendingToolCall>, String>
 where
     F: FnMut(&str),
 {
+    let tools_enabled = tool_config.enabled;
+    let sudo_enabled = tool_config.sudo_enabled;
     let mut response = match account.kind {
         ProviderKind::OpenAi | ProviderKind::Grok | ProviderKind::OpenRouter => {
             let url = format!("{base}/chat/completions");
@@ -612,7 +671,7 @@ where
                 "messages": conv,
             });
             if tools_enabled {
-                payload["tools"] = json!([openai_shell_tool_schema()]);
+                payload["tools"] = json!([openai_shell_tool_schema(sudo_enabled)]);
             }
             let mut req = agent
                 .post(&url)
@@ -634,7 +693,7 @@ where
                 "messages": conv,
             });
             if tools_enabled {
-                payload["tools"] = json!([claude_shell_tool_schema()]);
+                payload["tools"] = json!([claude_shell_tool_schema(sudo_enabled)]);
             }
             agent
                 .post(&url)
@@ -650,7 +709,7 @@ where
             });
             if tools_enabled {
                 payload["tools"] = json!([{
-                    "functionDeclarations": [gemini_shell_tool_schema()]
+                    "functionDeclarations": [gemini_shell_tool_schema(sudo_enabled)]
                 }]);
             }
             agent
@@ -667,7 +726,7 @@ where
                 "messages": conv,
             });
             if tools_enabled {
-                payload["tools"] = json!([openai_shell_tool_schema()]);
+                payload["tools"] = json!([openai_shell_tool_schema(sudo_enabled)]);
             }
             let mut req = agent.post(&url).header("Content-Type", "application/json");
             if !account.api_key.trim().is_empty() {

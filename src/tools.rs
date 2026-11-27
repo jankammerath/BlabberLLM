@@ -42,12 +42,29 @@ impl ShellExecutionResult {
     }
 }
 
-pub fn execute_shell_command(command: &str, working_dir: Option<&str>) -> ShellExecutionResult {
-    let mut cmd = Command::new("bash");
-    cmd.arg("-c").arg(command);
-    if let Some(dir) = working_dir.map(str::trim).filter(|d| !d.is_empty()) {
-        cmd.current_dir(dir);
-    }
+pub fn execute_shell_command(
+    command: &str,
+    working_dir: Option<&str>,
+    elevated: bool,
+) -> ShellExecutionResult {
+    let mut cmd = if elevated {
+        let mut c = Command::new("pkexec");
+        let full_cmd = if let Some(dir) = working_dir.map(str::trim).filter(|d| !d.is_empty()) {
+            let escaped_dir = dir.replace('\'', "'\\''");
+            format!("cd '{escaped_dir}' && {command}")
+        } else {
+            command.to_string()
+        };
+        c.arg("bash").arg("-c").arg(full_cmd);
+        c
+    } else {
+        let mut c = Command::new("bash");
+        c.arg("-c").arg(command);
+        if let Some(dir) = working_dir.map(str::trim).filter(|d| !d.is_empty()) {
+            c.current_dir(dir);
+        }
+        c
+    };
 
     match cmd.output() {
         Ok(output) => {
@@ -77,6 +94,31 @@ fn truncate_utf8(s: &str, max_bytes: usize) -> String {
         end -= 1;
     }
     format!("{}\n… [output truncated]", &s[..end])
+}
+
+/// Detects whether a command explicitly invokes `sudo` and returns the inner command
+/// with the leading `sudo` (and simple flags like `-n` or `--`) stripped.
+pub fn strip_leading_sudo(command: &str) -> Option<&str> {
+    let trimmed = command.trim_start();
+    let rest = trimmed.strip_prefix("sudo")?;
+    let first_ws = rest.chars().next()?;
+    if !first_ws.is_whitespace() {
+        return None;
+    }
+    let mut inner = rest.trim_start();
+    // Strip simple non-value flags like -n, -E, --
+    while let Some(flag_rest) = inner
+        .strip_prefix("-n ")
+        .or_else(|| inner.strip_prefix("-E "))
+        .or_else(|| inner.strip_prefix("-- "))
+    {
+        inner = flag_rest.trim_start();
+    }
+    if inner.is_empty() {
+        None
+    } else {
+        Some(inner)
+    }
 }
 
 /// Heuristic classifier for whether a shell command may modify files, system state,

@@ -24,6 +24,9 @@ pub fn build_markdown_view() -> gtk::TextView {
         .editable(false)
         .cursor_visible(false)
         .wrap_mode(gtk::WrapMode::WordChar)
+        .pixels_above_lines(1)
+        .pixels_below_lines(6)
+        .pixels_inside_wrap(5)
         .hexpand(true)
         .build();
     view.add_css_class("markdown-view");
@@ -44,17 +47,23 @@ pub fn set_markdown_content(view: &gtk::TextView, markdown: &str) {
 
     for (idx, block) in blocks.iter().enumerate() {
         if idx > 0 {
-            buffer.insert(&mut iter, "\n\n");
+            buffer.insert(&mut iter, "\n");
         }
 
         match block {
             MarkdownBlock::Heading { level, text } => {
+                let start_offset = iter.offset();
                 let markup = format_heading_markup(*level, text);
                 buffer.insert_markup(&mut iter, &markup);
+                let s = buffer.iter_at_offset(start_offset);
+                buffer.apply_tag_by_name("heading", &s, &iter);
             }
             MarkdownBlock::Paragraph(text) => {
+                let start_offset = iter.offset();
                 let markup = inline_to_pango(text);
                 buffer.insert_markup(&mut iter, &markup);
+                let s = buffer.iter_at_offset(start_offset);
+                buffer.apply_tag_by_name("paragraph", &s, &iter);
             }
             MarkdownBlock::CodeBlock { language, code } => {
                 let start_offset = iter.offset();
@@ -126,15 +135,31 @@ pub fn set_plain_content(view: &gtk::TextView, text: &str) {
 fn register_tags(buffer: &gtk::TextBuffer) {
     let tag_table = buffer.tag_table();
 
+    let heading_tag = gtk::TextTag::builder()
+        .name("heading")
+        .pixels_above_lines(10)
+        .pixels_below_lines(6)
+        .build();
+    tag_table.add(&heading_tag);
+
+    let paragraph_tag = gtk::TextTag::builder()
+        .name("paragraph")
+        .pixels_above_lines(2)
+        .pixels_below_lines(10)
+        .pixels_inside_wrap(6)
+        .build();
+    tag_table.add(&paragraph_tag);
+
     let code_bg = gdk::RGBA::new(0.5, 0.5, 0.5, 0.14);
     let code_block_tag = gtk::TextTag::builder()
         .name("code_block")
         .family("monospace")
         .scale(0.92)
-        .left_margin(10)
-        .right_margin(10)
-        .pixels_above_lines(2)
-        .pixels_below_lines(2)
+        .left_margin(12)
+        .right_margin(12)
+        .pixels_above_lines(3)
+        .pixels_below_lines(3)
+        .pixels_inside_wrap(3)
         .paragraph_background_rgba(&code_bg)
         .build();
     tag_table.add(&code_block_tag);
@@ -143,22 +168,28 @@ fn register_tags(buffer: &gtk::TextBuffer) {
         .name("code_lang")
         .scale(0.82)
         .weight(600)
+        .pixels_below_lines(4)
         .build();
     tag_table.add(&code_lang_tag);
 
     let list_item_tag = gtk::TextTag::builder()
         .name("list_item")
-        .left_margin(14)
+        .left_margin(18)
         .indent(-14)
-        .pixels_below_lines(2)
+        .pixels_above_lines(2)
+        .pixels_below_lines(8)
+        .pixels_inside_wrap(6)
         .build();
     tag_table.add(&list_item_tag);
 
     let quote_bg = gdk::RGBA::new(0.5, 0.5, 0.5, 0.08);
     let quote_tag = gtk::TextTag::builder()
         .name("quote")
-        .left_margin(14)
-        .right_margin(8)
+        .left_margin(16)
+        .right_margin(10)
+        .pixels_above_lines(4)
+        .pixels_below_lines(10)
+        .pixels_inside_wrap(6)
         .style(pango::Style::Italic)
         .paragraph_background_rgba(&quote_bg)
         .build();

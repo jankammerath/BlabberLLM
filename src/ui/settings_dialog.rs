@@ -299,8 +299,20 @@ pub fn present_settings_dialog(
         .sensitive(shell_enabled)
         .build();
 
+    let sudo_switch = adw::SwitchRow::builder()
+        .title("Allow Elevated Commands (sudo)")
+        .subtitle("Let the assistant request administrator privileges via system authentication")
+        .active(settings.borrow().shell_sudo_enabled())
+        .sensitive(shell_enabled)
+        .build();
+
     shell_switch
         .bind_property("active", &permission_row, "sensitive")
+        .sync_create()
+        .build();
+
+    shell_switch
+        .bind_property("active", &sudo_switch, "sensitive")
         .sync_create()
         .build();
 
@@ -327,8 +339,18 @@ pub fn present_settings_dialog(
         }
     });
 
+    sudo_switch.connect_active_notify({
+        let settings = Rc::clone(&settings);
+        move |row| {
+            let mut guard = settings.borrow_mut();
+            guard.set_shell_sudo_enabled(row.is_active());
+            let _ = guard.save();
+        }
+    });
+
     tools_group.add(&shell_switch);
     tools_group.add(&permission_row);
+    tools_group.add(&sudo_switch);
     providers_page.add(&tools_group);
 
     dialog.add(&providers_page);

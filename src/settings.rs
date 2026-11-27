@@ -173,6 +173,7 @@ pub struct AppSettings {
     default_model: Option<String>,
     shell_tool_enabled: bool,
     shell_permission_mode: ShellPermissionMode,
+    shell_sudo_enabled: bool,
 }
 
 impl AppSettings {
@@ -226,6 +227,7 @@ impl AppSettings {
             if let Ok(mode) = key_file.string("tools", "shell_permission") {
                 settings.shell_permission_mode = ShellPermissionMode::from_key(mode.as_str());
             }
+            settings.shell_sudo_enabled = key_file.boolean("tools", "sudo_enabled").unwrap_or(false);
         }
 
         if key_file.has_group("providers") {
@@ -315,6 +317,7 @@ impl AppSettings {
         }
         key_file.set_boolean("tools", "shell_enabled", self.shell_tool_enabled);
         key_file.set_string("tools", "shell_permission", self.shell_permission_mode.key());
+        key_file.set_boolean("tools", "sudo_enabled", self.shell_sudo_enabled);
         let ids: Vec<&str> = self.accounts.iter().map(|a| a.id.as_str()).collect();
         key_file.set_string("providers", "ids", &ids.join(","));
 
@@ -411,6 +414,14 @@ impl AppSettings {
 
     pub fn set_shell_permission_mode(&mut self, mode: ShellPermissionMode) {
         self.shell_permission_mode = mode;
+    }
+
+    pub fn shell_sudo_enabled(&self) -> bool {
+        self.shell_sudo_enabled
+    }
+
+    pub fn set_shell_sudo_enabled(&mut self, enabled: bool) {
+        self.shell_sudo_enabled = enabled;
     }
 }
 
