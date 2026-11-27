@@ -675,6 +675,11 @@ fn build_initial_conversation(
             continue;
         }
 
+        if msg.role == MessageRole::User && !msg.attachments.is_empty() {
+            conv.push(build_user_message_with_attachments(kind, msg));
+            continue;
+        }
+
         match kind {
             ProviderKind::Gemini => conv.push(json!({
                 "role": match msg.role {
@@ -691,6 +696,105 @@ fn build_initial_conversation(
     }
 
     conv
+}
+
+fn build_user_message_with_attachments(kind: ProviderKind, msg: &ChatMessage) -> Value {
+    let mut combined_text = String::new();
+    for att in msg.attachments.iter().filter(|a| !a.is_image) {
+        if !combined_text.is_empty() {
+            combined_text.push_str("\n\n");
+        }
+        combined_text.push_str(&format!(
+            "[Attached file: {}]\n```\n{}\n```",
+            att.name, att.data
+        ));
+    }
+    if !msg.content.trim().is_empty() {
+        if !combined_text.is_empty() {
+            combined_text.push_str("\n\n");
+        }
+        combined_text.push_str(&msg.content);
+    }
+    if combined_text.is_empty() {
+        combined_text.push_str("Please inspect the attached file(s).");
+    }
+
+    let images: Vec<_> = msg.attachments.iter().filter(|a| a.is_image).collect();
+    if images.is_empty() {
+        return match kind {
+            ProviderKind::Gemini => json!({
+                "role": "user",
+                "parts": [{ "text": combined_text }],
+            }),
+            _ => json!({
+                "role": "user",
+                "content": combined_text,
+            }),
+        };
+    }
+
+    match kind {
+        ProviderKind::OpenAi | ProviderKind::Grok | ProviderKind::OpenRouter => {
+            let mut content = vec![json!({ "type": "text", "text": combined_text })];
+            for img in images {
+                content.push(json!({
+                    "type": "image_url",
+                    "image_url": {
+                        "url": format!("data:{};base64,{}", img.mime_type, img.data),
+                    }
+                }));
+            }
+            json!({
+                "role": "user",
+                "content": content,
+            })
+        }
+        ProviderKind::Claude => {
+            let mut content = Vec::new();
+            for img in images {
+                content.push(json!({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": img.mime_type,
+                        "data": img.data,
+                    }
+                }));
+            }
+            content.push(json!({ "type": "text", "text": combined_text }));
+            json!({
+                "role": "user",
+                "content": content,
+            })
+        }
+        ProviderKind::Gemini => {
+            let mut parts = Vec::new();
+            for img in images {
+                parts.push(json!({
+                    "inline_data": {
+                        "mime_type": img.mime_type,
+                        "data": img.data,
+                    }
+                }));
+            }
+            parts.push(json!({ "text": combined_text }));
+            json!({
+                "role": "user",
+                "parts": parts,
+            })
+        }
+        ProviderKind::Ollama => {
+            let image_list: Vec<Value> = images
+                .into_iter()
+                .map(|img| Value::String(img.data.clone()))
+                .collect();
+            json!({
+                "role": "user",
+                "content": combined_text,
+                "images": image_list,
+            })
+        }
+    }
 }
 
 fn append_tool_turn(
@@ -1445,12 +1549,14 @@ mod tests {
             ChatMessage {
                 role: MessageRole::User,
                 content: "Check my OS".into(),
+                attachments: Vec::new(),
                 tool_calls: Vec::new(),
                 duration_ms: None,
             },
             ChatMessage {
                 role: MessageRole::Assistant,
                 content: "You are on Debian 13.".into(),
+                attachments: Vec::new(),
                 tool_calls: vec![ToolCallRecord {
                     command: "uname -a".into(),
                     working_directory: None,
@@ -1463,6 +1569,7 @@ mod tests {
             ChatMessage {
                 role: MessageRole::User,
                 content: "Now switch layout".into(),
+                attachments: Vec::new(),
                 tool_calls: Vec::new(),
                 duration_ms: None,
             },

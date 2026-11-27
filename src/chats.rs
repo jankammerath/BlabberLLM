@@ -6,6 +6,105 @@ use gtk::glib;
 
 use crate::ui::message::MessageRole;
 
+const MAX_TEXT_ATTACHMENT_BYTES: usize = 256 * 1024;
+const MAX_IMAGE_ATTACHMENT_BYTES: usize = 10 * 1024 * 1024;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChatAttachment {
+    pub name: String,
+    pub path: String,
+    pub mime_type: String,
+    pub is_image: bool,
+    /// UTF-8 content for text files, or base64-encoded bytes for images.
+    pub data: String,
+}
+
+impl ChatAttachment {
+    pub fn from_path(path: &Path) -> Result<Self, String> {
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("attachment")
+            .to_string();
+        let path_str = path.to_string_lossy().to_string();
+        let bytes = fs::read(path).map_err(|err| format!("Failed to read {name}: {err}"))?;
+
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .unwrap_or_default();
+
+        let image_mime = match ext.as_str() {
+            "png" => Some("image/png"),
+            "jpg" | "jpeg" => Some("image/jpeg"),
+            "webp" => Some("image/webp"),
+            "gif" => Some("image/gif"),
+            _ => None,
+        };
+
+        if let Some(mime) = image_mime {
+            if bytes.len() > MAX_IMAGE_ATTACHMENT_BYTES {
+                return Err(format!(
+                    "{name} is too large (max {} MB for images).",
+                    MAX_IMAGE_ATTACHMENT_BYTES / (1024 * 1024)
+                ));
+            }
+            return Ok(Self {
+                name,
+                path: path_str,
+                mime_type: mime.to_string(),
+                is_image: true,
+                data: encode_base64(&bytes),
+            });
+        }
+
+        let text = String::from_utf8(bytes)
+            .map_err(|_| format!("{name} is not a supported image or UTF-8 text file."))?;
+        let data = if text.len() > MAX_TEXT_ATTACHMENT_BYTES {
+            let mut end = MAX_TEXT_ATTACHMENT_BYTES;
+            while end > 0 && !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            format!("{}\n… [file truncated]", &text[..end])
+        } else {
+            text
+        };
+
+        Ok(Self {
+            name,
+            path: path_str,
+            mime_type: "text/plain".to_string(),
+            is_image: false,
+            data,
+        })
+    }
+}
+
+fn encode_base64(input: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[((triple >> 18) & 0x3F) as usize] as char);
+        out.push(TABLE[((triple >> 12) & 0x3F) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(TABLE[((triple >> 6) & 0x3F) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(TABLE[(triple & 0x3F) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ToolCallRecord {
     pub command: String,
@@ -19,6 +118,7 @@ pub struct ToolCallRecord {
 pub struct ChatMessage {
     pub role: MessageRole,
     pub content: String,
+    pub attachments: Vec<ChatAttachment>,
     pub tool_calls: Vec<ToolCallRecord>,
     pub duration_ms: Option<u64>,
 }
@@ -148,8 +248,19 @@ impl ChatStore {
         let _ = self.save_chat(chat_id);
     }
 
+    #[cfg(test)]
     pub fn append_message(&mut self, chat_id: &str, role: MessageRole, content: String) {
-        self.append_message_with_tools(chat_id, role, content, Vec::new(), None);
+        self.append_message_full(chat_id, role, content, Vec::new(), Vec::new(), None);
+    }
+
+    pub fn append_message_with_attachments(
+        &mut self,
+        chat_id: &str,
+        role: MessageRole,
+        content: String,
+        attachments: Vec<ChatAttachment>,
+    ) {
+        self.append_message_full(chat_id, role, content, attachments, Vec::new(), None);
     }
 
     pub fn append_message_with_tools(
@@ -157,6 +268,18 @@ impl ChatStore {
         chat_id: &str,
         role: MessageRole,
         content: String,
+        tool_calls: Vec<ToolCallRecord>,
+        duration_ms: Option<u64>,
+    ) {
+        self.append_message_full(chat_id, role, content, Vec::new(), tool_calls, duration_ms);
+    }
+
+    fn append_message_full(
+        &mut self,
+        chat_id: &str,
+        role: MessageRole,
+        content: String,
+        attachments: Vec<ChatAttachment>,
         tool_calls: Vec<ToolCallRecord>,
         duration_ms: Option<u64>,
     ) {
@@ -168,6 +291,7 @@ impl ChatStore {
         chat.messages.push(ChatMessage {
             role,
             content,
+            attachments,
             tool_calls,
             duration_ms,
         });
@@ -219,6 +343,17 @@ impl ChatStore {
             key_file.set_string(&group, "content", &msg.content);
             if let Some(ms) = msg.duration_ms {
                 key_file.set_uint64(&group, "duration_ms", ms);
+            }
+            if !msg.attachments.is_empty() {
+                key_file.set_uint64(&group, "attachment_count", msg.attachments.len() as u64);
+                for (a_idx, att) in msg.attachments.iter().enumerate() {
+                    let att_group = format!("message.{idx}.attachment.{a_idx}");
+                    key_file.set_string(&att_group, "name", &att.name);
+                    key_file.set_string(&att_group, "path", &att.path);
+                    key_file.set_string(&att_group, "mime_type", &att.mime_type);
+                    key_file.set_boolean(&att_group, "is_image", att.is_image);
+                    key_file.set_string(&att_group, "data", &att.data);
+                }
             }
             if !msg.tool_calls.is_empty() {
                 key_file.set_uint64(&group, "tool_count", msg.tool_calls.len() as u64);
@@ -287,6 +422,39 @@ fn load_chat_file(path: &Path) -> Option<ChatSession> {
             .unwrap_or_default();
         let duration_ms = key_file.uint64(&group, "duration_ms").ok();
 
+        let attachment_count = key_file.uint64(&group, "attachment_count").unwrap_or(0) as usize;
+        let mut attachments = Vec::with_capacity(attachment_count);
+        for a_idx in 0..attachment_count {
+            let att_group = format!("message.{idx}.attachment.{a_idx}");
+            if !key_file.has_group(&att_group) {
+                continue;
+            }
+            let name = key_file
+                .string(&att_group, "name")
+                .map(|s| s.to_string())
+                .unwrap_or_default();
+            let path = key_file
+                .string(&att_group, "path")
+                .map(|s| s.to_string())
+                .unwrap_or_default();
+            let mime_type = key_file
+                .string(&att_group, "mime_type")
+                .map(|s| s.to_string())
+                .unwrap_or_else(|_| "text/plain".to_string());
+            let is_image = key_file.boolean(&att_group, "is_image").unwrap_or(false);
+            let data = key_file
+                .string(&att_group, "data")
+                .map(|s| s.to_string())
+                .unwrap_or_default();
+            attachments.push(ChatAttachment {
+                name,
+                path,
+                mime_type,
+                is_image,
+                data,
+            });
+        }
+
         let tool_count = key_file.uint64(&group, "tool_count").unwrap_or(0) as usize;
         let mut tool_calls = Vec::with_capacity(tool_count);
         for t_idx in 0..tool_count {
@@ -321,6 +489,7 @@ fn load_chat_file(path: &Path) -> Option<ChatSession> {
         messages.push(ChatMessage {
             role,
             content,
+            attachments,
             tool_calls,
             duration_ms,
         });
@@ -415,5 +584,14 @@ mod tests {
         assert_eq!(chat.messages[1].tool_calls[0].output, "file1\nfile2");
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn encodes_base64_correctly() {
+        assert_eq!(encode_base64(b""), "");
+        assert_eq!(encode_base64(b"f"), "Zg==");
+        assert_eq!(encode_base64(b"fo"), "Zm8=");
+        assert_eq!(encode_base64(b"foo"), "Zm9v");
+        assert_eq!(encode_base64(b"Hello!"), "SGVsbG8h");
     }
 }

@@ -1,4 +1,5 @@
 use std::cell::{Cell, RefCell};
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
@@ -6,9 +7,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use adw::prelude::*;
-use gtk::{gdk, gio, glib};
+use gtk::{gdk, gio, glib, pango};
 
-use crate::chats::{ChatStore, ToolCallRecord};
+use crate::chats::{ChatAttachment, ChatStore, ToolCallRecord};
 use crate::llm::{self, ChatStreamEvent, ModelOption, ShellToolConfig, ShellToolRequest};
 use crate::settings::{AppSettings, ProviderAccount};
 
@@ -40,10 +41,13 @@ enum StreamChunk {
 
 struct ComposerWidgets {
     bar: gtk::Box,
+    card: gtk::Box,
+    attachments_box: gtk::FlowBox,
     input_view: gtk::TextView,
     model_dropdown: gtk::DropDown,
     refresh_models_button: gtk::Button,
     tools_toggle_button: gtk::ToggleButton,
+    attach_button: gtk::Button,
     send_button: gtk::Button,
 }
 
@@ -52,6 +56,7 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
     let chat_store = Rc::new(RefCell::new(ChatStore::load()));
     let active_chat_id: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
     let model_options: Rc<RefCell<Vec<ModelOption>>> = Rc::new(RefCell::new(Vec::new()));
+    let pending_attachments: Rc<RefCell<Vec<ChatAttachment>>> = Rc::new(RefCell::new(Vec::new()));
     let suppress_model_selection = Rc::new(Cell::new(false));
     let suppress_tools_toggle = Rc::new(Cell::new(false));
     let refresh_generation = Rc::new(Cell::new(0u64));
@@ -115,10 +120,13 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
     content_stack.set_visible_child_name("empty");
 
     let composer = build_composer(settings.borrow().shell_tool_enabled());
+    let composer_card = composer.card.clone();
+    let attachments_box = composer.attachments_box.clone();
     let input_view = composer.input_view.clone();
     let model_dropdown = composer.model_dropdown.clone();
     let refresh_models_button = composer.refresh_models_button.clone();
     let tools_toggle_button = composer.tools_toggle_button.clone();
+    let attach_button = composer.attach_button.clone();
     let send_button = composer.send_button.clone();
 
     let content_toolbar_view = adw::ToolbarView::new();
@@ -156,6 +164,8 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
         #[strong]
         model_options,
         #[strong]
+        pending_attachments,
+        #[strong]
         active_stream_cancel,
         move || {
             let is_streaming = active_stream_cancel.borrow().is_some();
@@ -172,12 +182,87 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
                 send_button.add_css_class("suggested-action");
                 let buffer = input_view.buffer();
                 let text = buffer.text(&buffer.start_iter(), &buffer.end_iter(), false);
-                let has_text = !text.trim().is_empty();
+                let has_content = !text.trim().is_empty() || !pending_attachments.borrow().is_empty();
                 let has_model = !model_options.borrow().is_empty();
-                send_button.set_sensitive(has_text && has_model);
+                send_button.set_sensitive(has_content && has_model);
             }
         }
     ));
+
+    let refresh_attachments_slot: Rc<RefCell<Option<Rc<dyn Fn()>>>> = Rc::new(RefCell::new(None));
+    let refresh_attachment_chips: Rc<dyn Fn()> = Rc::new(glib::clone!(
+        #[weak]
+        attachments_box,
+        #[strong]
+        pending_attachments,
+        #[strong]
+        update_send_button_state,
+        #[strong]
+        refresh_attachments_slot,
+        move || {
+            while let Some(child) = attachments_box.first_child() {
+                attachments_box.remove(&child);
+            }
+            let items = pending_attachments.borrow().clone();
+            attachments_box.set_visible(!items.is_empty());
+
+            for (idx, att) in items.iter().enumerate() {
+                let chip = gtk::Box::builder()
+                    .orientation(gtk::Orientation::Horizontal)
+                    .spacing(6)
+                    .build();
+                chip.add_css_class("attachment-chip");
+
+                let icon_name = if att.is_image {
+                    "image-x-generic-symbolic"
+                } else {
+                    "text-x-generic-symbolic"
+                };
+                let icon = gtk::Image::from_icon_name(icon_name);
+                icon.add_css_class("dim-label");
+
+                let label = gtk::Label::builder()
+                    .label(&att.name)
+                    .ellipsize(pango::EllipsizeMode::Middle)
+                    .max_width_chars(24)
+                    .build();
+                label.add_css_class("caption");
+
+                let remove_btn = gtk::Button::builder()
+                    .icon_name("window-close-symbolic")
+                    .tooltip_text(format!("Remove {}", att.name))
+                    .valign(gtk::Align::Center)
+                    .build();
+                remove_btn.add_css_class("flat");
+                remove_btn.add_css_class("circular");
+                remove_btn.add_css_class("attachment-remove-button");
+
+                remove_btn.connect_clicked({
+                    let pending_attachments = Rc::clone(&pending_attachments);
+                    let refresh_attachments_slot = Rc::clone(&refresh_attachments_slot);
+                    move |_| {
+                        {
+                            let mut list = pending_attachments.borrow_mut();
+                            if idx < list.len() {
+                                list.remove(idx);
+                            }
+                        }
+                        if let Some(refresh) = refresh_attachments_slot.borrow().as_ref() {
+                            refresh();
+                        }
+                    }
+                });
+
+                chip.append(&icon);
+                chip.append(&label);
+                chip.append(&remove_btn);
+                attachments_box.insert(&chip, -1);
+            }
+
+            update_send_button_state();
+        }
+    ));
+    *refresh_attachments_slot.borrow_mut() = Some(Rc::clone(&refresh_attachment_chips));
 
     let cancel_active_stream: Rc<dyn Fn()> = Rc::new({
         let active_stream_cancel = Rc::clone(&active_stream_cancel);
@@ -469,6 +554,10 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
         #[strong]
         active_chat_id,
         #[strong]
+        pending_attachments,
+        #[strong]
+        refresh_attachment_chips,
+        #[strong]
         sidebar_slot,
         #[strong]
         cancel_active_stream,
@@ -479,6 +568,8 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
         move || {
             cancel_active_stream();
             *active_chat_id.borrow_mut() = None;
+            pending_attachments.borrow_mut().clear();
+            refresh_attachment_chips();
             clear_box(&messages_box);
             content_stack.set_visible_child_name("empty");
             title.set_title("BlabberLLM");
@@ -527,6 +618,7 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
                 messages_box.append(&build_message_row(
                     msg.role,
                     &msg.content,
+                    &msg.attachments,
                     &msg.tool_calls,
                     msg.duration_ms,
                 ));
@@ -596,6 +688,98 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
     breakpoint.add_setter(&split_view, "collapsed", Some(&true.to_value()));
     window.add_breakpoint(breakpoint);
 
+    let attach_paths: Rc<dyn Fn(Vec<PathBuf>)> = Rc::new(glib::clone!(
+        #[weak]
+        window,
+        #[strong]
+        pending_attachments,
+        #[strong]
+        refresh_attachment_chips,
+        move |paths: Vec<PathBuf>| {
+            let mut errors = Vec::new();
+            {
+                let mut list = pending_attachments.borrow_mut();
+                for path in paths {
+                    let path_str = path.to_string_lossy();
+                    if list.iter().any(|a| a.path == path_str) {
+                        continue;
+                    }
+                    match ChatAttachment::from_path(&path) {
+                        Ok(att) => list.push(att),
+                        Err(err) => errors.push(err),
+                    }
+                }
+            }
+            refresh_attachment_chips();
+
+            if !errors.is_empty() {
+                let alert = adw::AlertDialog::builder()
+                    .heading("Could Not Attach File")
+                    .body(errors.join("\n"))
+                    .default_response("ok")
+                    .close_response("ok")
+                    .build();
+                alert.add_responses(&[("ok", "OK")]);
+                alert.present(Some(&window));
+            }
+        }
+    ));
+
+    attach_button.connect_clicked(glib::clone!(
+        #[weak]
+        window,
+        #[strong]
+        attach_paths,
+        move |_| {
+            let file_dialog = gtk::FileDialog::builder()
+                .title("Attach Files")
+                .modal(true)
+                .build();
+            let attach_paths = Rc::clone(&attach_paths);
+            file_dialog.open_multiple(
+                Some(&window),
+                gio::Cancellable::NONE,
+                move |result| {
+                    if let Ok(list_model) = result {
+                        let mut paths = Vec::new();
+                        for i in 0..list_model.n_items() {
+                            if let Some(obj) = list_model.item(i) {
+                                if let Ok(file) = obj.downcast::<gio::File>() {
+                                    if let Some(path) = file.path() {
+                                        paths.push(path);
+                                    }
+                                }
+                            }
+                        }
+                        if !paths.is_empty() {
+                            attach_paths(paths);
+                        }
+                    }
+                },
+            );
+        }
+    ));
+
+    let drop_target = gtk::DropTarget::new(gdk::FileList::static_type(), gdk::DragAction::COPY);
+    drop_target.connect_drop({
+        let attach_paths = Rc::clone(&attach_paths);
+        move |_, value, _, _| {
+            if let Ok(file_list) = value.get::<gdk::FileList>() {
+                let paths: Vec<PathBuf> = file_list
+                    .files()
+                    .into_iter()
+                    .filter_map(|f| f.path())
+                    .collect();
+                if !paths.is_empty() {
+                    attach_paths(paths);
+                    return true;
+                }
+            }
+            false
+        }
+    });
+    composer_card.add_controller(drop_target);
+
     let submit_message: Rc<dyn Fn()> = Rc::new(glib::clone!(
         #[weak]
         window,
@@ -622,6 +806,10 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
         #[strong]
         model_options,
         #[strong]
+        pending_attachments,
+        #[strong]
+        refresh_attachment_chips,
+        #[strong]
         active_stream_cancel,
         #[strong]
         update_send_button_state,
@@ -635,7 +823,7 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
             let buffer = input_view.buffer();
             let raw_text = buffer.text(&buffer.start_iter(), &buffer.end_iter(), false);
             let prompt = raw_text.trim();
-            if prompt.is_empty() {
+            if prompt.is_empty() && pending_attachments.borrow().is_empty() {
                 return;
             }
 
@@ -662,7 +850,18 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
             };
 
             let prompt_owned = prompt.to_string();
+            let attachments: Vec<ChatAttachment> =
+                std::mem::take(&mut *pending_attachments.borrow_mut());
             buffer.set_text("");
+            refresh_attachment_chips();
+
+            let title_seed = if !prompt_owned.is_empty() {
+                prompt_owned.clone()
+            } else if let Some(first) = attachments.first() {
+                format!("File: {}", first.name)
+            } else {
+                "New Chat".to_string()
+            };
 
             let chat_id = {
                 let mut current = active_chat_id.borrow_mut();
@@ -679,7 +878,7 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
                     }
                     None => {
                         let new_id = chat_store.borrow_mut().create_chat(
-                            &prompt_owned,
+                            &title_seed,
                             Some(option.account_id.clone()),
                             Some(option.model.clone()),
                             Some(session_tools_enabled),
@@ -692,7 +891,12 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
 
             let history = {
                 let mut store = chat_store.borrow_mut();
-                store.append_message(&chat_id, MessageRole::User, prompt_owned.clone());
+                store.append_message_with_attachments(
+                    &chat_id,
+                    MessageRole::User,
+                    prompt_owned.clone(),
+                    attachments.clone(),
+                );
                 if let Some(chat) = store.get(&chat_id) {
                     title.set_title(&chat.title);
                 }
@@ -704,7 +908,13 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
             };
 
             content_stack.set_visible_child_name("chat");
-            messages_box.append(&build_message_row(MessageRole::User, &prompt_owned, &[], None));
+            messages_box.append(&build_message_row(
+                MessageRole::User,
+                &prompt_owned,
+                &attachments,
+                &[],
+                None,
+            ));
 
             let assistant_handle = build_streaming_assistant_row();
             messages_box.append(&assistant_handle.row);
@@ -1253,6 +1463,14 @@ fn build_composer(initial_tools_enabled: bool) -> ComposerWidgets {
     tools_toggle_button.add_css_class("tools-toggle");
     update_tools_toggle_tooltip(&tools_toggle_button, initial_tools_enabled);
 
+    let attach_button = gtk::Button::builder()
+        .icon_name("mail-attachment-symbolic")
+        .tooltip_text("Attach files (or drag and drop)")
+        .valign(gtk::Align::Center)
+        .build();
+    attach_button.add_css_class("flat");
+    attach_button.add_css_class("circular");
+
     let spacer = gtk::Box::builder().hexpand(true).build();
 
     let send_button = gtk::Button::builder()
@@ -1273,8 +1491,17 @@ fn build_composer(initial_tools_enabled: bool) -> ComposerWidgets {
     composer_toolbar.append(&model_dropdown);
     composer_toolbar.append(&refresh_models_button);
     composer_toolbar.append(&tools_toggle_button);
+    composer_toolbar.append(&attach_button);
     composer_toolbar.append(&spacer);
     composer_toolbar.append(&send_button);
+
+    let attachments_box = gtk::FlowBox::builder()
+        .selection_mode(gtk::SelectionMode::None)
+        .row_spacing(6)
+        .column_spacing(6)
+        .max_children_per_line(6)
+        .visible(false)
+        .build();
 
     let composer_card = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
@@ -1283,6 +1510,7 @@ fn build_composer(initial_tools_enabled: bool) -> ComposerWidgets {
         .build();
     composer_card.add_css_class("card");
     composer_card.add_css_class("composer-card");
+    composer_card.append(&attachments_box);
     composer_card.append(&input_overlay);
     composer_card.append(&composer_toolbar);
 
@@ -1301,10 +1529,13 @@ fn build_composer(initial_tools_enabled: bool) -> ComposerWidgets {
 
     ComposerWidgets {
         bar: composer_bar,
+        card: composer_card,
+        attachments_box,
         input_view,
         model_dropdown,
         refresh_models_button,
         tools_toggle_button,
+        attach_button,
         send_button,
     }
 }

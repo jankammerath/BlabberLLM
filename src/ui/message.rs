@@ -4,7 +4,7 @@ use std::rc::Rc;
 use adw::prelude::*;
 use gtk::{gdk, glib, pango};
 
-use crate::chats::ToolCallRecord;
+use crate::chats::{ChatAttachment, ToolCallRecord};
 
 use super::markdown::{
     build_markdown_view, set_markdown_content, set_plain_content, set_plain_dim_content,
@@ -298,6 +298,7 @@ fn build_copy_button(text_source: Rc<RefCell<String>>) -> gtk::Button {
 pub fn build_message_row(
     role: MessageRole,
     text: &str,
+    attachments: &[ChatAttachment],
     tool_calls: &[ToolCallRecord],
     duration_ms: Option<u64>,
 ) -> gtk::Box {
@@ -318,14 +319,49 @@ pub fn build_message_row(
             bubble.add_css_class("message-bubble");
             bubble.add_css_class("user-bubble");
 
-            let content_label = gtk::Label::builder()
-                .label(text)
-                .wrap(true)
-                .wrap_mode(pango::WrapMode::WordChar)
-                .selectable(true)
-                .xalign(0.0)
-                .build();
-            bubble.append(&content_label);
+            if !attachments.is_empty() {
+                let att_flow = gtk::FlowBox::builder()
+                    .selection_mode(gtk::SelectionMode::None)
+                    .row_spacing(4)
+                    .column_spacing(6)
+                    .max_children_per_line(4)
+                    .build();
+                for att in attachments {
+                    let pill = gtk::Box::builder()
+                        .orientation(gtk::Orientation::Horizontal)
+                        .spacing(5)
+                        .build();
+                    pill.add_css_class("user-attachment-pill");
+
+                    let icon_name = if att.is_image {
+                        "image-x-generic-symbolic"
+                    } else {
+                        "text-x-generic-symbolic"
+                    };
+                    let icon = gtk::Image::from_icon_name(icon_name);
+                    let name_label = gtk::Label::builder()
+                        .label(&att.name)
+                        .ellipsize(pango::EllipsizeMode::Middle)
+                        .max_width_chars(24)
+                        .build();
+                    name_label.add_css_class("caption");
+                    pill.append(&icon);
+                    pill.append(&name_label);
+                    att_flow.insert(&pill, -1);
+                }
+                bubble.append(&att_flow);
+            }
+
+            if !text.trim().is_empty() {
+                let content_label = gtk::Label::builder()
+                    .label(text)
+                    .wrap(true)
+                    .wrap_mode(pango::WrapMode::WordChar)
+                    .selectable(true)
+                    .xalign(0.0)
+                    .build();
+                bubble.append(&content_label);
+            }
             row.append(&bubble);
         }
         MessageRole::Assistant => {
