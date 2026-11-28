@@ -183,6 +183,56 @@ impl ShellPermissionMode {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentProfile {
+    pub id: String,
+    pub name: String,
+    pub account_id: Option<String>,
+    pub model: Option<String>,
+    pub shell_tool_enabled: bool,
+    pub system_prompt: String,
+}
+
+impl AgentProfile {
+    pub fn new(
+        name: String,
+        account_id: Option<String>,
+        model: Option<String>,
+        shell_tool_enabled: bool,
+        system_prompt: String,
+    ) -> Self {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let seq = NEXT_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+        Self {
+            id: format!("agent-{nanos}-{seq}"),
+            name,
+            account_id,
+            model,
+            shell_tool_enabled,
+            system_prompt,
+        }
+    }
+
+    pub fn prompt_preview(&self) -> String {
+        let first_line = self
+            .system_prompt
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .unwrap_or("Empty system prompt");
+        let mut chars = first_line.chars();
+        let preview: String = chars.by_ref().take(64).collect();
+        if chars.next().is_some() {
+            format!("{}…", preview.trim_end())
+        } else {
+            preview
+        }
+    }
+}
+
 pub const DEFAULT_MAX_TOOL_STEPS: usize = 10;
 pub const MIN_MAX_TOOL_STEPS: usize = 1;
 pub const MAX_MAX_TOOL_STEPS: usize = 100;
@@ -190,8 +240,10 @@ pub const MAX_MAX_TOOL_STEPS: usize = 100;
 #[derive(Clone, Debug)]
 pub struct AppSettings {
     accounts: Vec<ProviderAccount>,
+    agents: Vec<AgentProfile>,
     default_account_id: Option<String>,
     default_model: Option<String>,
+    default_agent_id: Option<String>,
     shell_tool_enabled: bool,
     shell_permission_mode: ShellPermissionMode,
     shell_sudo_enabled: bool,
@@ -202,8 +254,10 @@ impl Default for AppSettings {
     fn default() -> Self {
         Self {
             accounts: Vec::new(),
+            agents: Vec::new(),
             default_account_id: None,
             default_model: None,
+            default_agent_id: None,
             shell_tool_enabled: false,
             shell_permission_mode: ShellPermissionMode::default(),
             shell_sudo_enabled: false,
@@ -245,6 +299,11 @@ impl AppSettings {
                 .ok()
                 .map(|s| s.to_string())
                 .filter(|s| !s.is_empty());
+            settings.default_agent_id = key_file
+                .string("defaults", "agent_id")
+                .ok()
+                .map(|s| s.to_string())
+                .filter(|s| !s.is_empty());
         } else if key_file.has_group("selection") {
             settings.default_account_id = key_file
                 .string("selection", "account_id")
@@ -266,6 +325,46 @@ impl AppSettings {
             settings.shell_sudo_enabled = key_file.boolean("tools", "sudo_enabled").unwrap_or(false);
             if let Ok(steps) = key_file.integer("tools", "max_steps") {
                 settings.set_max_tool_steps(steps.max(1) as usize);
+            }
+        }
+
+        if key_file.has_group("agents") {
+            if let Ok(raw_ids) = key_file.string("agents", "ids") {
+                for id_str in raw_ids.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                    let group = format!("agent.{id_str}");
+                    if !key_file.has_group(&group) {
+                        continue;
+                    }
+                    let name = key_file
+                        .string(&group, "name")
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|_| "Agent".to_string());
+                    let account_id = key_file
+                        .string(&group, "account_id")
+                        .ok()
+                        .map(|s| s.to_string())
+                        .filter(|s| !s.is_empty());
+                    let model = key_file
+                        .string(&group, "model")
+                        .ok()
+                        .map(|s| s.to_string())
+                        .filter(|s| !s.is_empty());
+                    let shell_tool_enabled = key_file
+                        .boolean(&group, "shell_enabled")
+                        .unwrap_or(settings.shell_tool_enabled);
+                    let system_prompt = key_file
+                        .string(&group, "system_prompt")
+                        .map(|s| s.to_string())
+                        .unwrap_or_default();
+                    settings.agents.push(AgentProfile {
+                        id: id_str.to_string(),
+                        name,
+                        account_id,
+                        model,
+                        shell_tool_enabled,
+                        system_prompt,
+                    });
+                }
             }
         }
 
@@ -365,10 +464,28 @@ impl AppSettings {
         if let Some(model) = &self.default_model {
             key_file.set_string("defaults", "model", model);
         }
+        if let Some(agent_id) = &self.default_agent_id {
+            key_file.set_string("defaults", "agent_id", agent_id);
+        }
         key_file.set_boolean("tools", "shell_enabled", self.shell_tool_enabled);
         key_file.set_string("tools", "shell_permission", self.shell_permission_mode.key());
         key_file.set_boolean("tools", "sudo_enabled", self.shell_sudo_enabled);
         key_file.set_integer("tools", "max_steps", self.max_tool_steps as i32);
+
+        let agent_ids: Vec<&str> = self.agents.iter().map(|a| a.id.as_str()).collect();
+        key_file.set_string("agents", "ids", &agent_ids.join(","));
+        for agent in &self.agents {
+            let group = format!("agent.{}", agent.id);
+            key_file.set_string(&group, "name", &agent.name);
+            if let Some(acc_id) = &agent.account_id {
+                key_file.set_string(&group, "account_id", acc_id);
+            }
+            if let Some(model) = &agent.model {
+                key_file.set_string(&group, "model", model);
+            }
+            key_file.set_boolean(&group, "shell_enabled", agent.shell_tool_enabled);
+            key_file.set_string(&group, "system_prompt", &agent.system_prompt);
+        }
         let ids: Vec<&str> = self.accounts.iter().map(|a| a.id.as_str()).collect();
         key_file.set_string("providers", "ids", &ids.join(","));
 
@@ -434,6 +551,12 @@ impl AppSettings {
             self.default_account_id = None;
             self.default_model = None;
         }
+        for agent in &mut self.agents {
+            if agent.account_id.as_deref() == Some(id) {
+                agent.account_id = None;
+                agent.model = None;
+            }
+        }
         true
     }
 
@@ -487,6 +610,47 @@ impl AppSettings {
     pub fn set_max_tool_steps(&mut self, steps: usize) {
         self.max_tool_steps = steps.clamp(MIN_MAX_TOOL_STEPS, MAX_MAX_TOOL_STEPS);
     }
+
+    pub fn agents(&self) -> &[AgentProfile] {
+        &self.agents
+    }
+
+    pub fn agent(&self, id: &str) -> Option<&AgentProfile> {
+        self.agents.iter().find(|a| a.id == id)
+    }
+
+    pub fn suggested_agent_name(&self) -> String {
+        format!("Agent {}", self.agents.len() + 1)
+    }
+
+    pub fn add_agent(&mut self, agent: AgentProfile) {
+        self.agents.push(agent);
+    }
+
+    pub fn update_agent(&mut self, updated: AgentProfile) {
+        if let Some(existing) = self.agents.iter_mut().find(|a| a.id == updated.id) {
+            *existing = updated;
+        }
+    }
+
+    pub fn remove_agent(&mut self, id: &str) -> bool {
+        let Some(pos) = self.agents.iter().position(|a| a.id == id) else {
+            return false;
+        };
+        self.agents.remove(pos);
+        if self.default_agent_id.as_deref() == Some(id) {
+            self.default_agent_id = None;
+        }
+        true
+    }
+
+    pub fn default_agent_id(&self) -> Option<&str> {
+        self.default_agent_id.as_deref()
+    }
+
+    pub fn set_default_agent_id(&mut self, id: Option<String>) {
+        self.default_agent_id = id;
+    }
 }
 
 #[cfg(test)]
@@ -527,6 +691,16 @@ mod tests {
         settings.add_account(ollama.clone());
         settings.set_default_model(Some(work_openai.id.clone()), Some("gpt-4o".into()));
 
+        let coder = AgentProfile::new(
+            "Rust Expert".into(),
+            Some(work_openai.id.clone()),
+            Some("gpt-4o".into()),
+            true,
+            "You are a concise Rust engineer.\nPrefer idiomatic code.".into(),
+        );
+        settings.add_agent(coder.clone());
+        settings.set_default_agent_id(Some(coder.id.clone()));
+
         settings.save_to_path(&path).expect("save settings");
         let loaded = AppSettings::load_from_path(&path);
 
@@ -539,6 +713,9 @@ mod tests {
             loaded.default_model(),
             Some((work_openai.id.as_str(), "gpt-4o"))
         );
+        assert_eq!(loaded.agents().len(), 1);
+        assert_eq!(loaded.agent(&coder.id), Some(&coder));
+        assert_eq!(loaded.default_agent_id(), Some(coder.id.as_str()));
 
         let _ = fs::remove_dir_all(&dir);
     }

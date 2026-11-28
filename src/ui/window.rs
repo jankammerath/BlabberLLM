@@ -11,7 +11,7 @@ use gtk::{gdk, gio, glib, pango};
 
 use crate::chats::{ChatAttachment, ChatStore, ToolCallRecord};
 use crate::llm::{self, ChatStreamEvent, ModelOption, ShellToolConfig, ShellToolRequest};
-use crate::settings::{AppSettings, ProviderAccount};
+use crate::settings::{AgentProfile, AppSettings, ProviderAccount};
 
 use super::message::{build_message_row, build_streaming_assistant_row, MessageRole};
 use super::settings_dialog::present_settings_dialog;
@@ -39,6 +39,46 @@ enum StreamChunk {
     Finished(Result<String, String>),
 }
 
+#[derive(Clone, Debug)]
+enum PickerEntry {
+    Agent {
+        agent: AgentProfile,
+        account_id: String,
+        model: String,
+    },
+    Model(ModelOption),
+}
+
+impl PickerEntry {
+    fn display_label(&self) -> String {
+        match self {
+            PickerEntry::Agent { agent, model, .. } => format!("{} • Agent ({})", agent.name, model),
+            PickerEntry::Model(opt) => opt.display_label(),
+        }
+    }
+
+    fn account_id(&self) -> &str {
+        match self {
+            PickerEntry::Agent { account_id, .. } => account_id,
+            PickerEntry::Model(opt) => &opt.account_id,
+        }
+    }
+
+    fn model(&self) -> &str {
+        match self {
+            PickerEntry::Agent { model, .. } => model,
+            PickerEntry::Model(opt) => &opt.model,
+        }
+    }
+
+    fn agent(&self) -> Option<&AgentProfile> {
+        match self {
+            PickerEntry::Agent { agent, .. } => Some(agent),
+            PickerEntry::Model(_) => None,
+        }
+    }
+}
+
 struct ComposerWidgets {
     bar: gtk::Box,
     card: gtk::Box,
@@ -56,6 +96,7 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
     let chat_store = Rc::new(RefCell::new(ChatStore::load()));
     let active_chat_id: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
     let model_options: Rc<RefCell<Vec<ModelOption>>> = Rc::new(RefCell::new(Vec::new()));
+    let picker_entries: Rc<RefCell<Vec<PickerEntry>>> = Rc::new(RefCell::new(Vec::new()));
     let pending_attachments: Rc<RefCell<Vec<ChatAttachment>>> = Rc::new(RefCell::new(Vec::new()));
     let suppress_model_selection = Rc::new(Cell::new(false));
     let suppress_tools_toggle = Rc::new(Cell::new(false));
@@ -162,7 +203,7 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
         #[weak]
         send_button,
         #[strong]
-        model_options,
+        picker_entries,
         #[strong]
         pending_attachments,
         #[strong]
@@ -183,7 +224,7 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
                 let buffer = input_view.buffer();
                 let text = buffer.text(&buffer.start_iter(), &buffer.end_iter(), false);
                 let has_content = !text.trim().is_empty() || !pending_attachments.borrow().is_empty();
-                let has_model = !model_options.borrow().is_empty();
+                let has_model = !picker_entries.borrow().is_empty();
                 send_button.set_sensitive(has_content && has_model);
             }
         }
@@ -282,6 +323,45 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
         move |_| update_send_button_state()
     });
 
+    let sync_tools_toggle_for_current_context: Rc<dyn Fn()> = Rc::new(glib::clone!(
+        #[weak]
+        model_dropdown,
+        #[weak]
+        tools_toggle_button,
+        #[strong]
+        settings,
+        #[strong]
+        chat_store,
+        #[strong]
+        active_chat_id,
+        #[strong]
+        picker_entries,
+        #[strong]
+        suppress_tools_toggle,
+        move || {
+            let chat_override = active_chat_id
+                .borrow()
+                .as_deref()
+                .and_then(|id| chat_store.borrow().get(id).and_then(|c| c.tool_use_enabled));
+
+            let enabled = if let Some(saved) = chat_override {
+                saved
+            } else {
+                let idx = model_dropdown.selected() as usize;
+                if let Some(PickerEntry::Agent { agent, .. }) = picker_entries.borrow().get(idx) {
+                    agent.shell_tool_enabled
+                } else {
+                    settings.borrow().shell_tool_enabled()
+                }
+            };
+
+            suppress_tools_toggle.set(true);
+            tools_toggle_button.set_active(enabled);
+            update_tools_toggle_tooltip(&tools_toggle_button, enabled);
+            suppress_tools_toggle.set(false);
+        }
+    ));
+
     let select_model_for_current_context: Rc<dyn Fn()> = Rc::new(glib::clone!(
         #[weak]
         model_dropdown,
@@ -292,43 +372,66 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
         #[strong]
         active_chat_id,
         #[strong]
-        model_options,
+        picker_entries,
         #[strong]
         suppress_model_selection,
         #[strong]
         update_send_button_state,
+        #[strong]
+        sync_tools_toggle_for_current_context,
         move || {
-            let options = model_options.borrow();
-            if options.is_empty() {
+            let entries = picker_entries.borrow();
+            if entries.is_empty() {
+                drop(entries);
+                sync_tools_toggle_for_current_context();
                 return;
             }
 
-            let chat_pref = active_chat_id.borrow().as_deref().and_then(|id| {
-                let store = chat_store.borrow();
-                let chat = store.get(id)?;
-                Some((chat.last_account_id.clone()?, chat.last_model.clone()?))
-            });
-
-            let default_pref = settings
-                .borrow()
-                .default_model()
-                .map(|(a, m)| (a.to_string(), m.to_string()));
-
-            let find_index = |(acc_id, model): &(String, String)| {
-                options
-                    .iter()
-                    .position(|opt| opt.account_id == *acc_id && opt.model == *model)
+            let find_agent = |agent_id: &str| {
+                entries.iter().position(|e| match e {
+                    PickerEntry::Agent { agent, .. } => agent.id == agent_id,
+                    _ => false,
+                })
+            };
+            let find_model = |acc_id: &str, model: &str| {
+                entries.iter().position(|e| match e {
+                    PickerEntry::Model(opt) => opt.account_id == acc_id && opt.model == model,
+                    _ => false,
+                })
             };
 
-            let target_idx = chat_pref
-                .as_ref()
-                .and_then(find_index)
-                .or_else(|| default_pref.as_ref().and_then(find_index))
-                .unwrap_or(0);
+            let target_idx = if let Some(chat_id) = active_chat_id.borrow().as_deref() {
+                let store = chat_store.borrow();
+                if let Some(chat) = store.get(chat_id) {
+                    chat.last_agent_id
+                        .as_deref()
+                        .and_then(find_agent)
+                        .or_else(|| {
+                            match (
+                                chat.last_account_id.as_deref(),
+                                chat.last_model.as_deref(),
+                            ) {
+                                (Some(a), Some(m)) => find_model(a, m),
+                                _ => None,
+                            }
+                        })
+                } else {
+                    None
+                }
+            } else {
+                let guard = settings.borrow();
+                guard
+                    .default_agent_id()
+                    .and_then(find_agent)
+                    .or_else(|| guard.default_model().and_then(|(a, m)| find_model(a, m)))
+            }
+            .unwrap_or(0);
 
+            drop(entries);
             suppress_model_selection.set(true);
             model_dropdown.set_selected(target_idx as u32);
             suppress_model_selection.set(false);
+            sync_tools_toggle_for_current_context();
             update_send_button_state();
         }
     ));
@@ -337,7 +440,11 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
         #[weak]
         model_dropdown,
         #[strong]
+        settings,
+        #[strong]
         model_options,
+        #[strong]
+        picker_entries,
         #[strong]
         suppress_model_selection,
         #[strong]
@@ -345,25 +452,28 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
         #[strong]
         select_model_for_current_context,
         move |options: Vec<ModelOption>| {
+            let entries = build_picker_entries(&settings.borrow(), &options);
+            *model_options.borrow_mut() = options;
+
             suppress_model_selection.set(true);
 
-            if options.is_empty() {
+            if entries.is_empty() {
                 let placeholder = gtk::StringList::new(&["No models — configure Settings"]);
                 model_dropdown.set_model(Some(&placeholder));
                 model_dropdown.set_selected(0);
                 model_dropdown.set_sensitive(false);
-                *model_options.borrow_mut() = Vec::new();
+                *picker_entries.borrow_mut() = Vec::new();
                 suppress_model_selection.set(false);
                 update_send_button_state();
                 return;
             }
 
-            let labels: Vec<String> = options.iter().map(ModelOption::display_label).collect();
+            let labels: Vec<String> = entries.iter().map(PickerEntry::display_label).collect();
             let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
             let list = gtk::StringList::new(&label_refs);
             model_dropdown.set_model(Some(&list));
             model_dropdown.set_sensitive(true);
-            *model_options.borrow_mut() = options;
+            *picker_entries.borrow_mut() = entries;
             suppress_model_selection.set(false);
 
             select_model_for_current_context();
@@ -371,23 +481,39 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
     ));
 
     model_dropdown.connect_selected_notify({
+        let settings = Rc::clone(&settings);
         let chat_store = Rc::clone(&chat_store);
         let active_chat_id = Rc::clone(&active_chat_id);
-        let model_options = Rc::clone(&model_options);
+        let picker_entries = Rc::clone(&picker_entries);
         let suppress_model_selection = Rc::clone(&suppress_model_selection);
+        let suppress_tools_toggle = Rc::clone(&suppress_tools_toggle);
+        let tools_toggle_button = tools_toggle_button.clone();
         let update_send_button_state = Rc::clone(&update_send_button_state);
         move |dropdown| {
             if suppress_model_selection.get() {
                 return;
             }
             let idx = dropdown.selected() as usize;
-            if let Some(chosen) = model_options.borrow().get(idx) {
+            if let Some(chosen) = picker_entries.borrow().get(idx).cloned() {
+                let default_shell = match &chosen {
+                    PickerEntry::Agent { agent, .. } => agent.shell_tool_enabled,
+                    PickerEntry::Model(_) => settings.borrow().shell_tool_enabled(),
+                };
+
+                suppress_tools_toggle.set(true);
+                tools_toggle_button.set_active(default_shell);
+                update_tools_toggle_tooltip(&tools_toggle_button, default_shell);
+                suppress_tools_toggle.set(false);
+
                 if let Some(chat_id) = active_chat_id.borrow().as_deref() {
-                    chat_store.borrow_mut().set_chat_model(
+                    let mut store = chat_store.borrow_mut();
+                    store.set_chat_model(
                         chat_id,
-                        chosen.account_id.clone(),
-                        chosen.model.clone(),
+                        chosen.account_id().to_string(),
+                        chosen.model().to_string(),
                     );
+                    store.set_chat_agent(chat_id, chosen.agent().map(|a| a.id.clone()));
+                    store.set_chat_tool_use(chat_id, default_shell);
                 }
             }
             update_send_button_state();
@@ -500,32 +626,6 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
         move |_| refresh_models()
     });
 
-    let sync_tools_toggle_for_current_context: Rc<dyn Fn()> = Rc::new(glib::clone!(
-        #[weak]
-        tools_toggle_button,
-        #[strong]
-        settings,
-        #[strong]
-        chat_store,
-        #[strong]
-        active_chat_id,
-        #[strong]
-        suppress_tools_toggle,
-        move || {
-            let default_enabled = settings.borrow().shell_tool_enabled();
-            let enabled = active_chat_id
-                .borrow()
-                .as_deref()
-                .and_then(|id| chat_store.borrow().get(id).and_then(|c| c.tool_use_enabled))
-                .unwrap_or(default_enabled);
-
-            suppress_tools_toggle.set(true);
-            tools_toggle_button.set_active(enabled);
-            update_tools_toggle_tooltip(&tools_toggle_button, enabled);
-            suppress_tools_toggle.set(false);
-        }
-    ));
-
     tools_toggle_button.connect_toggled({
         let chat_store = Rc::clone(&chat_store);
         let active_chat_id = Rc::clone(&active_chat_id);
@@ -565,8 +665,6 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
         cancel_active_stream,
         #[strong]
         select_model_for_current_context,
-        #[strong]
-        sync_tools_toggle_for_current_context,
         move || {
             cancel_active_stream();
             *active_chat_id.borrow_mut() = None;
@@ -579,7 +677,6 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
                 sidebar.clear_selection();
             }
             select_model_for_current_context();
-            sync_tools_toggle_for_current_context();
             input_view.grab_focus();
         }
     ));
@@ -605,8 +702,6 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
         cancel_active_stream,
         #[strong]
         select_model_for_current_context,
-        #[strong]
-        sync_tools_toggle_for_current_context,
         move |chat_id: String| {
             cancel_active_stream();
             let store = chat_store.borrow();
@@ -634,7 +729,6 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
             drop(store);
 
             select_model_for_current_context();
-            sync_tools_toggle_for_current_context();
 
             if split_view.is_collapsed() {
                 split_view.set_show_sidebar(false);
@@ -677,7 +771,7 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
         .title("BlabberLLM")
         .default_width(960)
         .default_height(660)
-        .width_request(360)
+        .width_request(460)
         .height_request(420)
         .content(&split_view)
         .build();
@@ -806,7 +900,7 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
         #[strong]
         active_chat_id,
         #[strong]
-        model_options,
+        picker_entries,
         #[strong]
         pending_attachments,
         #[strong]
@@ -829,17 +923,22 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
                 return;
             }
 
-            let selected_option = {
+            let selected_entry = {
                 let idx = model_dropdown.selected() as usize;
-                model_options.borrow().get(idx).cloned()
+                picker_entries.borrow().get(idx).cloned()
             };
-            let Some(option) = selected_option else {
+            let Some(entry) = selected_entry else {
                 return;
             };
+            let account_id = entry.account_id().to_string();
+            let model_name = entry.model().to_string();
+            let selected_agent_id = entry.agent().map(|a| a.id.clone());
+            let system_prompt = entry.agent().map(|a| a.system_prompt.clone());
+
             let session_tools_enabled = tools_toggle_button.is_active();
             let (account, tool_config) = {
                 let guard = settings.borrow();
-                let Some(acc) = guard.get(&option.account_id).cloned() else {
+                let Some(acc) = guard.get(&account_id).cloned() else {
                     return;
                 };
                 let cfg = ShellToolConfig {
@@ -872,17 +971,19 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
                         let mut store = chat_store.borrow_mut();
                         store.set_chat_model(
                             existing,
-                            option.account_id.clone(),
-                            option.model.clone(),
+                            account_id.clone(),
+                            model_name.clone(),
                         );
+                        store.set_chat_agent(existing, selected_agent_id.clone());
                         store.set_chat_tool_use(existing, session_tools_enabled);
                         existing.clone()
                     }
                     None => {
                         let new_id = chat_store.borrow_mut().create_chat(
                             &title_seed,
-                            Some(option.account_id.clone()),
-                            Some(option.model.clone()),
+                            Some(account_id.clone()),
+                            Some(model_name.clone()),
+                            selected_agent_id.clone(),
                             Some(session_tools_enabled),
                         );
                         *current = Some(new_id.clone());
@@ -929,12 +1030,12 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
             update_send_button_state();
 
             let (tx, rx) = mpsc::channel::<StreamChunk>();
-            let model_name = option.model.clone();
             let worker_cancel = Arc::clone(&cancel_flag);
             thread::spawn(move || {
                 let result = llm::stream_chat_with_tools(
                     &account,
                     &model_name,
+                    system_prompt.as_deref(),
                     &history,
                     &tool_config,
                     &worker_cancel,
@@ -1217,16 +1318,9 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
         #[strong]
         settings,
         #[strong]
-        active_chat_id,
-        #[strong]
         refresh_models,
-        #[strong]
-        sync_tools_toggle_for_current_context,
         move || {
             title.set_subtitle(&providers_subtitle(&settings.borrow()));
-            if active_chat_id.borrow().is_none() {
-                sync_tools_toggle_for_current_context();
-            }
             refresh_models();
         }
     ));
@@ -1270,6 +1364,45 @@ pub fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
     input_view.grab_focus();
 
     window
+}
+
+fn build_picker_entries(settings: &AppSettings, models: &[ModelOption]) -> Vec<PickerEntry> {
+    let mut entries = Vec::new();
+    let fallback_pair = settings
+        .default_model()
+        .map(|(a, m)| (a.to_string(), m.to_string()))
+        .or_else(|| {
+            models
+                .first()
+                .map(|opt| (opt.account_id.clone(), opt.model.clone()))
+        });
+
+    for agent in settings.agents() {
+        let resolved = match (agent.account_id.as_deref(), agent.model.as_deref()) {
+            (Some(acc_id), Some(model))
+                if settings
+                    .get(acc_id)
+                    .map(|a| a.is_configured())
+                    .unwrap_or(false) =>
+            {
+                Some((acc_id.to_string(), model.to_string()))
+            }
+            _ => fallback_pair.clone(),
+        };
+        if let Some((account_id, model)) = resolved {
+            entries.push(PickerEntry::Agent {
+                agent: agent.clone(),
+                account_id,
+                model,
+            });
+        }
+    }
+
+    for opt in models {
+        entries.push(PickerEntry::Model(opt.clone()));
+    }
+
+    entries
 }
 
 fn present_shell_approval_dialog(
@@ -1436,9 +1569,56 @@ fn build_composer(initial_tools_enabled: bool) -> ComposerWidgets {
         gtk::Expression::NONE,
         "string",
     );
+
+    let button_factory = gtk::SignalListItemFactory::new();
+    button_factory.connect_setup(|_, list_item| {
+        if let Some(item) = list_item.downcast_ref::<gtk::ListItem>() {
+            let label = gtk::Label::builder()
+                .xalign(0.0)
+                .ellipsize(pango::EllipsizeMode::End)
+                .single_line_mode(true)
+                .max_width_chars(32)
+                .build();
+            item.set_child(Some(&label));
+        }
+    });
+    button_factory.connect_bind(|_, list_item| {
+        if let Some(item) = list_item.downcast_ref::<gtk::ListItem>() {
+            if let (Some(obj), Some(label)) = (
+                item.item().and_downcast::<gtk::StringObject>(),
+                item.child().and_downcast::<gtk::Label>(),
+            ) {
+                label.set_label(&obj.string());
+            }
+        }
+    });
+
+    let popup_factory = gtk::SignalListItemFactory::new();
+    popup_factory.connect_setup(|_, list_item| {
+        if let Some(item) = list_item.downcast_ref::<gtk::ListItem>() {
+            let label = gtk::Label::builder()
+                .xalign(0.0)
+                .single_line_mode(true)
+                .build();
+            item.set_child(Some(&label));
+        }
+    });
+    popup_factory.connect_bind(|_, list_item| {
+        if let Some(item) = list_item.downcast_ref::<gtk::ListItem>() {
+            if let (Some(obj), Some(label)) = (
+                item.item().and_downcast::<gtk::StringObject>(),
+                item.child().and_downcast::<gtk::Label>(),
+            ) {
+                label.set_label(&obj.string());
+            }
+        }
+    });
+
     let model_dropdown = gtk::DropDown::builder()
         .model(&empty_model)
         .expression(&search_expression)
+        .factory(&button_factory)
+        .list_factory(&popup_factory)
         .enable_search(true)
         .sensitive(false)
         .valign(gtk::Align::Center)

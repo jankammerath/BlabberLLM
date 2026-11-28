@@ -130,6 +130,7 @@ pub struct ChatSession {
     pub updated_at: i64,
     pub last_account_id: Option<String>,
     pub last_model: Option<String>,
+    pub last_agent_id: Option<String>,
     pub tool_use_enabled: Option<bool>,
     pub messages: Vec<ChatMessage>,
 }
@@ -139,6 +140,7 @@ impl ChatSession {
         first_prompt: &str,
         last_account_id: Option<String>,
         last_model: Option<String>,
+        last_agent_id: Option<String>,
         tool_use_enabled: Option<bool>,
     ) -> Self {
         let now = unix_timestamp_secs();
@@ -152,6 +154,7 @@ impl ChatSession {
             updated_at: now,
             last_account_id,
             last_model,
+            last_agent_id,
             tool_use_enabled,
             messages: Vec::new(),
         }
@@ -214,13 +217,25 @@ impl ChatStore {
         first_prompt: &str,
         account_id: Option<String>,
         model: Option<String>,
+        agent_id: Option<String>,
         tool_use_enabled: Option<bool>,
     ) -> String {
-        let chat = ChatSession::new(first_prompt, account_id, model, tool_use_enabled);
+        let chat = ChatSession::new(first_prompt, account_id, model, agent_id, tool_use_enabled);
         let id = chat.id.clone();
         self.chats.insert(0, chat);
         let _ = self.save_chat(&id);
         id
+    }
+
+    pub fn set_chat_agent(&mut self, chat_id: &str, agent_id: Option<String>) {
+        let Some(chat) = self.chats.iter_mut().find(|c| c.id == chat_id) else {
+            return;
+        };
+        if chat.last_agent_id == agent_id {
+            return;
+        }
+        chat.last_agent_id = agent_id;
+        let _ = self.save_chat(chat_id);
     }
 
     pub fn set_chat_tool_use(&mut self, chat_id: &str, enabled: bool) {
@@ -332,6 +347,9 @@ impl ChatStore {
         if let Some(model) = &chat.last_model {
             key_file.set_string("chat", "last_model", model);
         }
+        if let Some(agent_id) = &chat.last_agent_id {
+            key_file.set_string("chat", "last_agent_id", agent_id);
+        }
         if let Some(enabled) = chat.tool_use_enabled {
             key_file.set_boolean("chat", "tool_use_enabled", enabled);
         }
@@ -397,6 +415,11 @@ fn load_chat_file(path: &Path) -> Option<ChatSession> {
         .filter(|s| !s.is_empty());
     let last_model = key_file
         .string("chat", "last_model")
+        .ok()
+        .map(|s| s.to_string())
+        .filter(|s| !s.is_empty());
+    let last_agent_id = key_file
+        .string("chat", "last_agent_id")
         .ok()
         .map(|s| s.to_string())
         .filter(|s| !s.is_empty());
@@ -501,6 +524,7 @@ fn load_chat_file(path: &Path) -> Option<ChatSession> {
         updated_at,
         last_account_id,
         last_model,
+        last_agent_id,
         tool_use_enabled,
         messages,
     })
@@ -546,6 +570,7 @@ mod tests {
             "Hello\nsecond line",
             Some("provider-1".into()),
             Some("claude-sonnet-4-5".into()),
+            Some("agent-1".into()),
             Some(true),
         );
         store.append_message(&id, MessageRole::User, "Hello\nsecond line".into());

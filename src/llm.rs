@@ -275,6 +275,7 @@ impl PendingToolCall {
 pub fn stream_chat_with_tools<FEvent, FApprove>(
     account: &ProviderAccount,
     model: &str,
+    system_prompt: Option<&str>,
     messages: &[ChatMessage],
     tool_config: &ShellToolConfig,
     cancel: &AtomicBool,
@@ -314,6 +315,7 @@ where
             account,
             base,
             model,
+            system_prompt,
             &conv,
             tool_config,
             cancel,
@@ -1037,6 +1039,7 @@ fn run_single_turn<F>(
     account: &ProviderAccount,
     base: &str,
     model: &str,
+    system_prompt: Option<&str>,
     conv: &[Value],
     tool_config: &ShellToolConfig,
     cancel: &AtomicBool,
@@ -1047,13 +1050,19 @@ where
 {
     let tools_enabled = tool_config.enabled;
     let sudo_enabled = tool_config.sudo_enabled;
+    let sys_prompt = system_prompt.map(str::trim).filter(|s| !s.is_empty());
     let mut response = match account.kind {
         ProviderKind::OpenAi | ProviderKind::Grok | ProviderKind::OpenRouter => {
             let url = format!("{base}/chat/completions");
+            let mut full_messages = Vec::with_capacity(conv.len() + 1);
+            if let Some(prompt) = sys_prompt {
+                full_messages.push(json!({ "role": "system", "content": prompt }));
+            }
+            full_messages.extend_from_slice(conv);
             let mut payload = json!({
                 "model": model,
                 "stream": true,
-                "messages": conv,
+                "messages": full_messages,
             });
             if tools_enabled {
                 payload["tools"] = json!([openai_shell_tool_schema(sudo_enabled)]);
@@ -1089,6 +1098,9 @@ where
                 "stream": true,
                 "messages": conv,
             });
+            if let Some(prompt) = sys_prompt {
+                payload["system"] = Value::String(prompt.to_string());
+            }
             let mut claude_tools = Vec::new();
             if tools_enabled {
                 claude_tools.push(claude_shell_tool_schema(sudo_enabled));
@@ -1120,6 +1132,11 @@ where
             let mut payload = json!({
                 "contents": conv,
             });
+            if let Some(prompt) = sys_prompt {
+                payload["system_instruction"] = json!({
+                    "parts": [{ "text": prompt }]
+                });
+            }
             let mut gemini_tools = Vec::new();
             if tools_enabled {
                 gemini_tools.push(json!({
@@ -1143,10 +1160,15 @@ where
         }
         ProviderKind::Ollama => {
             let url = format!("{base}/api/chat");
+            let mut full_messages = Vec::with_capacity(conv.len() + 1);
+            if let Some(prompt) = sys_prompt {
+                full_messages.push(json!({ "role": "system", "content": prompt }));
+            }
+            full_messages.extend_from_slice(conv);
             let mut payload = json!({
                 "model": model,
                 "stream": true,
-                "messages": conv,
+                "messages": full_messages,
             });
             if tools_enabled {
                 payload["tools"] = json!([openai_shell_tool_schema(sudo_enabled)]);

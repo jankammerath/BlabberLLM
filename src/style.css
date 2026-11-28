@@ -68,6 +68,15 @@
     padding: 4px 10px;
 }
 
+.agent-prompt-input,
+.agent-prompt-input text {
+    background: transparent;
+}
+
+.agent-prompt-card {
+    padding: 8px 10px;
+}
+
 .composer-input,
 .composer-input text {
     background: transparent;

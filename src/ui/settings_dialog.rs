@@ -9,8 +9,8 @@ use gtk::glib;
 
 use crate::llm::{self, GroundingToolInfo, ModelOption};
 use crate::settings::{
-    AppSettings, ProviderAccount, ProviderKind, ShellPermissionMode, MAX_MAX_TOOL_STEPS,
-    MIN_MAX_TOOL_STEPS,
+    AgentProfile, AppSettings, ProviderAccount, ProviderKind, ShellPermissionMode,
+    MAX_MAX_TOOL_STEPS, MIN_MAX_TOOL_STEPS,
 };
 
 pub fn present_settings_dialog(
@@ -78,9 +78,30 @@ pub fn present_settings_dialog(
 
     providers_page.add(&providers_group);
 
+    let agents_list_box = gtk::ListBox::builder()
+        .selection_mode(gtk::SelectionMode::None)
+        .build();
+    agents_list_box.add_css_class("boxed-list");
+
+    let agents_group = adw::PreferencesGroup::builder()
+        .title("Agents")
+        .description("Define reusable system prompts as agents.")
+        .build();
+    agents_group.add(&agents_list_box);
+
+    let add_agent_button = gtk::Button::builder()
+        .icon_name("list-add-symbolic")
+        .label("Add Agent")
+        .valign(gtk::Align::Center)
+        .build();
+    add_agent_button.add_css_class("flat");
+    agents_group.set_header_suffix(Some(&add_agent_button));
+
+    providers_page.add(&agents_group);
+
     let defaults_group = adw::PreferencesGroup::builder()
-        .title("Default Model")
-        .description("Provider and model selected automatically when starting a new chat.")
+        .title("Defaults")
+        .description("Provider, model, and agent selected automatically when starting a new chat.")
         .build();
 
     let default_provider_row = adw::ComboRow::builder()
@@ -100,12 +121,18 @@ pub fn present_settings_dialog(
         .sensitive(false)
         .build();
 
+    let default_agent_row = adw::ComboRow::builder()
+        .title("Default Agent")
+        .build();
+
     defaults_group.add(&default_provider_row);
     defaults_group.add(&default_model_row);
+    defaults_group.add(&default_agent_row);
     providers_page.add(&defaults_group);
 
     let default_accounts_state: Rc<RefCell<Vec<ProviderAccount>>> = Rc::new(RefCell::new(Vec::new()));
     let default_models_state: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+    let default_agents_state: Rc<RefCell<Vec<AgentProfile>>> = Rc::new(RefCell::new(Vec::new()));
     let suppress_defaults = Rc::new(Cell::new(false));
 
     let populate_default_models: Rc<dyn Fn(&ProviderAccount, Option<&str>)> = Rc::new(glib::clone!(
@@ -160,6 +187,70 @@ pub fn present_settings_dialog(
             }
 
             suppress_defaults.set(prev_suppress);
+        }
+    ));
+
+    let refresh_default_agent: Rc<dyn Fn()> = Rc::new(glib::clone!(
+        #[weak]
+        default_agent_row,
+        #[strong]
+        settings,
+        #[strong]
+        default_agents_state,
+        #[strong]
+        suppress_defaults,
+        move || {
+            let prev = suppress_defaults.get();
+            suppress_defaults.set(true);
+
+            let agents = settings.borrow().agents().to_vec();
+            let mut labels = vec!["None".to_string()];
+            labels.extend(agents.iter().map(|a| a.name.clone()));
+            let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+            let list = gtk::StringList::new(&refs);
+            default_agent_row.set_model(Some(&list));
+
+            let selected_idx = settings
+                .borrow()
+                .default_agent_id()
+                .and_then(|id| agents.iter().position(|a| a.id == id))
+                .map(|idx| idx + 1)
+                .unwrap_or(0);
+            default_agent_row.set_selected(selected_idx as u32);
+
+            *default_agents_state.borrow_mut() = agents;
+            suppress_defaults.set(prev);
+        }
+    ));
+
+    default_agent_row.connect_selected_notify(glib::clone!(
+        #[strong]
+        settings,
+        #[strong]
+        default_agents_state,
+        #[strong]
+        suppress_defaults,
+        #[strong]
+        on_changed,
+        move |row| {
+            if suppress_defaults.get() {
+                return;
+            }
+            let idx = row.selected() as usize;
+            let chosen_id = if idx == 0 {
+                None
+            } else {
+                default_agents_state
+                    .borrow()
+                    .get(idx - 1)
+                    .map(|a| a.id.clone())
+            };
+            {
+                let mut guard = settings.borrow_mut();
+                guard.set_default_agent_id(chosen_id);
+                let _ = guard.save();
+            }
+            on_changed();
         }
     ));
 
@@ -545,6 +636,119 @@ pub fn present_settings_dialog(
 
     *refresh_slot.borrow_mut() = Some(Rc::clone(&refresh_list));
     refresh_list();
+
+    let refresh_agents_slot: Rc<RefCell<Option<Rc<dyn Fn()>>>> = Rc::new(RefCell::new(None));
+    let refresh_agents_list: Rc<dyn Fn()> = Rc::new(glib::clone!(
+        #[weak]
+        nav_view,
+        #[weak]
+        agents_list_box,
+        #[strong]
+        settings,
+        #[strong]
+        model_options,
+        #[strong]
+        on_changed,
+        #[strong]
+        refresh_agents_slot,
+        #[strong]
+        refresh_default_agent,
+        move || {
+            refresh_default_agent();
+
+            while let Some(child) = agents_list_box.first_child() {
+                agents_list_box.remove(&child);
+            }
+
+            let agents = settings.borrow().agents().to_vec();
+            if agents.is_empty() {
+                let empty_row = adw::ActionRow::builder()
+                    .title("No agents defined")
+                    .subtitle("Click Add Agent to create a reusable system prompt.")
+                    .activatable(false)
+                    .build();
+                empty_row.set_use_markup(false);
+                agents_list_box.append(&empty_row);
+                return;
+            }
+
+            for agent in agents {
+                let model_label = agent
+                    .model
+                    .as_deref()
+                    .unwrap_or("Default model");
+                let shell_label = if agent.shell_tool_enabled {
+                    "Shell on"
+                } else {
+                    "Shell off"
+                };
+                let subtitle = format!("{model_label} · {shell_label} · {}", agent.prompt_preview());
+
+                let row = adw::ActionRow::builder()
+                    .title(&agent.name)
+                    .subtitle(&subtitle)
+                    .activatable(true)
+                    .build();
+                row.set_use_markup(false);
+
+                let chevron = gtk::Image::from_icon_name("go-next-symbolic");
+                chevron.add_css_class("dim-label");
+                row.add_suffix(&chevron);
+
+                let agent_id = agent.id.clone();
+                row.connect_activated(glib::clone!(
+                    #[weak]
+                    nav_view,
+                    #[strong]
+                    settings,
+                    #[strong]
+                    model_options,
+                    #[strong]
+                    on_changed,
+                    #[strong]
+                    refresh_agents_slot,
+                    move |_| {
+                        if let Some(refresh) = refresh_agents_slot.borrow().as_ref() {
+                            push_edit_agent_page(
+                                &nav_view,
+                                Rc::clone(&settings),
+                                Rc::clone(&model_options),
+                                agent_id.clone(),
+                                Rc::clone(refresh),
+                                Rc::clone(&on_changed),
+                            );
+                        }
+                    }
+                ));
+
+                agents_list_box.append(&row);
+            }
+        }
+    ));
+    *refresh_agents_slot.borrow_mut() = Some(Rc::clone(&refresh_agents_list));
+    refresh_agents_list();
+
+    add_agent_button.connect_clicked(glib::clone!(
+        #[weak]
+        nav_view,
+        #[strong]
+        settings,
+        #[strong]
+        model_options,
+        #[strong]
+        refresh_agents_list,
+        #[strong]
+        on_changed,
+        move |_| {
+            push_add_agent_page(
+                &nav_view,
+                Rc::clone(&settings),
+                Rc::clone(&model_options),
+                Rc::clone(&refresh_agents_list),
+                Rc::clone(&on_changed),
+            );
+        }
+    ));
 
     add_button.connect_clicked(glib::clone!(
         #[weak]
@@ -1169,6 +1373,459 @@ fn build_grounding_tools_section(
 
     load_tools();
     group
+}
+
+struct AgentFormWidgets {
+    name_row: adw::EntryRow,
+    provider_row: adw::ComboRow,
+    model_row: adw::ComboRow,
+    shell_switch: adw::SwitchRow,
+    prompt_view: gtk::TextView,
+    accounts_state: Rc<RefCell<Vec<ProviderAccount>>>,
+    models_state: Rc<RefCell<Vec<String>>>,
+    suppress_model_events: Rc<Cell<bool>>,
+    group: adw::PreferencesGroup,
+}
+
+impl AgentFormWidgets {
+    fn selected_provider_and_model(&self) -> (Option<String>, Option<String>) {
+        let p_idx = self.provider_row.selected() as usize;
+        if p_idx == 0 {
+            return (None, None);
+        }
+        let account_id = self
+            .accounts_state
+            .borrow()
+            .get(p_idx - 1)
+            .map(|a| a.id.clone());
+        let m_idx = self.model_row.selected() as usize;
+        let model = self.models_state.borrow().get(m_idx).cloned();
+        (account_id, model)
+    }
+}
+
+fn build_agent_form(
+    settings: &Rc<RefCell<AppSettings>>,
+    model_options: &Rc<RefCell<Vec<ModelOption>>>,
+    name: &str,
+    initial_account_id: Option<&str>,
+    initial_model: Option<&str>,
+    initial_shell_enabled: bool,
+    system_prompt: &str,
+) -> AgentFormWidgets {
+    let name_row = adw::EntryRow::builder()
+        .title("Agent Name")
+        .text(name)
+        .build();
+
+    let configured_accounts: Vec<ProviderAccount> = settings
+        .borrow()
+        .accounts()
+        .iter()
+        .filter(|a| a.is_configured())
+        .cloned()
+        .collect();
+
+    let mut provider_labels = vec!["Use Default Provider".to_string()];
+    provider_labels.extend(
+        configured_accounts
+            .iter()
+            .map(|a| format!("{} ({})", a.name, a.kind.display_name())),
+    );
+    let provider_refs: Vec<&str> = provider_labels.iter().map(String::as_str).collect();
+    let provider_list = gtk::StringList::new(&provider_refs);
+
+    let initial_provider_idx = initial_account_id
+        .and_then(|id| configured_accounts.iter().position(|a| a.id == id))
+        .map(|pos| pos + 1)
+        .unwrap_or(0);
+
+    let provider_row = adw::ComboRow::builder()
+        .title("Provider")
+        .model(&provider_list)
+        .selected(initial_provider_idx as u32)
+        .build();
+
+    let model_search_expr = gtk::PropertyExpression::new(
+        gtk::StringObject::static_type(),
+        gtk::Expression::NONE,
+        "string",
+    );
+    let model_row = adw::ComboRow::builder()
+        .title("Model")
+        .expression(&model_search_expr)
+        .enable_search(true)
+        .build();
+
+    let accounts_state = Rc::new(RefCell::new(configured_accounts));
+    let models_state: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+    let suppress_model_events = Rc::new(Cell::new(false));
+
+    let populate_models: Rc<dyn Fn(usize, Option<&str>)> = Rc::new(glib::clone!(
+        #[weak]
+        model_row,
+        #[strong]
+        model_options,
+        #[strong]
+        accounts_state,
+        #[strong]
+        models_state,
+        #[strong]
+        suppress_model_events,
+        move |provider_idx: usize, preferred_model: Option<&str>| {
+            suppress_model_events.set(true);
+            if provider_idx == 0 {
+                let placeholder = gtk::StringList::new(&["Use Default Model"]);
+                model_row.set_model(Some(&placeholder));
+                model_row.set_selected(0);
+                model_row.set_sensitive(false);
+                *models_state.borrow_mut() = Vec::new();
+                suppress_model_events.set(false);
+                return;
+            }
+
+            let Some(account) = accounts_state.borrow().get(provider_idx - 1).cloned() else {
+                model_row.set_sensitive(false);
+                suppress_model_events.set(false);
+                return;
+            };
+
+            let mut models: Vec<String> = model_options
+                .borrow()
+                .iter()
+                .filter(|opt| opt.account_id == account.id)
+                .map(|opt| opt.model.clone())
+                .collect();
+            if models.is_empty() {
+                models = llm::fallback_models(account.kind)
+                    .iter()
+                    .map(|m| (*m).to_string())
+                    .collect();
+            }
+            if let Some(pref) = preferred_model {
+                if !pref.trim().is_empty() && !models.iter().any(|m| m == pref) {
+                    models.insert(0, pref.to_string());
+                }
+            }
+
+            if models.is_empty() {
+                let placeholder = gtk::StringList::new(&["No models available"]);
+                model_row.set_model(Some(&placeholder));
+                model_row.set_selected(0);
+                model_row.set_sensitive(false);
+                *models_state.borrow_mut() = Vec::new();
+            } else {
+                let refs: Vec<&str> = models.iter().map(String::as_str).collect();
+                let list = gtk::StringList::new(&refs);
+                model_row.set_model(Some(&list));
+                model_row.set_sensitive(true);
+                let idx = preferred_model
+                    .and_then(|pref| models.iter().position(|m| m == pref))
+                    .unwrap_or(0);
+                model_row.set_selected(idx as u32);
+                *models_state.borrow_mut() = models;
+            }
+            suppress_model_events.set(false);
+        }
+    ));
+
+    populate_models(initial_provider_idx, initial_model);
+
+    provider_row.connect_selected_notify({
+        let populate_models = Rc::clone(&populate_models);
+        move |row| {
+            populate_models(row.selected() as usize, None);
+        }
+    });
+
+    let shell_switch = adw::SwitchRow::builder()
+        .title("Shell Tool by Default")
+        .subtitle("Enable shell command execution by default when using this agent")
+        .active(initial_shell_enabled)
+        .build();
+
+    let prompt_view = gtk::TextView::builder()
+        .wrap_mode(gtk::WrapMode::WordChar)
+        .accepts_tab(false)
+        .top_margin(6)
+        .bottom_margin(6)
+        .left_margin(4)
+        .right_margin(4)
+        .hexpand(true)
+        .vexpand(true)
+        .build();
+    prompt_view.add_css_class("agent-prompt-input");
+    prompt_view.buffer().set_text(system_prompt);
+
+    let prompt_scroll = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vscrollbar_policy(gtk::PolicyType::Automatic)
+        .min_content_height(180)
+        .max_content_height(320)
+        .hexpand(true)
+        .child(&prompt_view)
+        .build();
+
+    let prompt_card = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .hexpand(true)
+        .build();
+    prompt_card.add_css_class("card");
+    prompt_card.add_css_class("agent-prompt-card");
+    prompt_card.append(&prompt_scroll);
+
+    let prompt_heading = gtk::Label::builder()
+        .label("System Prompt")
+        .xalign(0.0)
+        .margin_top(12)
+        .margin_bottom(6)
+        .build();
+    prompt_heading.add_css_class("heading");
+
+    let group = adw::PreferencesGroup::builder()
+        .title("Agent Details")
+        .build();
+    group.add(&name_row);
+    group.add(&provider_row);
+    group.add(&model_row);
+    group.add(&shell_switch);
+    group.add(&prompt_heading);
+    group.add(&prompt_card);
+
+    AgentFormWidgets {
+        name_row,
+        provider_row,
+        model_row,
+        shell_switch,
+        prompt_view,
+        accounts_state,
+        models_state,
+        suppress_model_events,
+        group,
+    }
+}
+
+fn push_add_agent_page(
+    nav_view: &adw::NavigationView,
+    settings: Rc<RefCell<AppSettings>>,
+    model_options: Rc<RefCell<Vec<ModelOption>>>,
+    refresh_agents_list: Rc<dyn Fn()>,
+    on_changed: Rc<dyn Fn()>,
+) {
+    let initial_name = settings.borrow().suggested_agent_name();
+    let initial_shell = settings.borrow().shell_tool_enabled();
+    let form = Rc::new(build_agent_form(
+        &settings,
+        &model_options,
+        &initial_name,
+        None,
+        None,
+        initial_shell,
+        "",
+    ));
+
+    let add_confirm_button = gtk::Button::builder()
+        .label("Add Agent")
+        .halign(gtk::Align::Center)
+        .margin_top(12)
+        .build();
+    add_confirm_button.add_css_class("suggested-action");
+    add_confirm_button.add_css_class("pill");
+
+    add_confirm_button.connect_clicked(glib::clone!(
+        #[weak]
+        nav_view,
+        #[strong]
+        form,
+        #[strong]
+        settings,
+        #[strong]
+        refresh_agents_list,
+        #[strong]
+        on_changed,
+        move |_| {
+            let raw_name = form.name_row.text().trim().to_string();
+            let name = if raw_name.is_empty() {
+                settings.borrow().suggested_agent_name()
+            } else {
+                raw_name
+            };
+            let (account_id, model) = form.selected_provider_and_model();
+            let shell_tool_enabled = form.shell_switch.is_active();
+            let buf = form.prompt_view.buffer();
+            let system_prompt = buf.text(&buf.start_iter(), &buf.end_iter(), false).to_string();
+
+            let agent = AgentProfile::new(name, account_id, model, shell_tool_enabled, system_prompt);
+            {
+                let mut guard = settings.borrow_mut();
+                guard.add_agent(agent);
+                let _ = guard.save();
+            }
+
+            refresh_agents_list();
+            on_changed();
+            nav_view.pop();
+        }
+    ));
+
+    let action_group = adw::PreferencesGroup::new();
+    action_group.add(&add_confirm_button);
+
+    let page_content = adw::PreferencesPage::new();
+    page_content.add(&form.group);
+    page_content.add(&action_group);
+
+    let header_bar = adw::HeaderBar::new();
+    let toolbar_view = adw::ToolbarView::new();
+    toolbar_view.add_top_bar(&header_bar);
+    toolbar_view.set_content(Some(&page_content));
+
+    let nav_page = adw::NavigationPage::builder()
+        .title("Add Agent")
+        .child(&toolbar_view)
+        .build();
+
+    nav_view.push(&nav_page);
+}
+
+fn push_edit_agent_page(
+    nav_view: &adw::NavigationView,
+    settings: Rc<RefCell<AppSettings>>,
+    model_options: Rc<RefCell<Vec<ModelOption>>>,
+    agent_id: String,
+    refresh_agents_list: Rc<dyn Fn()>,
+    on_changed: Rc<dyn Fn()>,
+) {
+    let Some(agent) = settings.borrow().agent(&agent_id).cloned() else {
+        return;
+    };
+
+    let form = Rc::new(build_agent_form(
+        &settings,
+        &model_options,
+        &agent.name,
+        agent.account_id.as_deref(),
+        agent.model.as_deref(),
+        agent.shell_tool_enabled,
+        &agent.system_prompt,
+    ));
+
+    let save_edits: Rc<dyn Fn()> = Rc::new(glib::clone!(
+        #[strong]
+        form,
+        #[strong]
+        settings,
+        #[strong]
+        agent_id,
+        #[strong]
+        refresh_agents_list,
+        #[strong]
+        on_changed,
+        move || {
+            let raw_name = form.name_row.text().trim().to_string();
+            let name = if raw_name.is_empty() {
+                "Agent".to_string()
+            } else {
+                raw_name
+            };
+            let (account_id, model) = form.selected_provider_and_model();
+            let shell_tool_enabled = form.shell_switch.is_active();
+            let buf = form.prompt_view.buffer();
+            let system_prompt = buf.text(&buf.start_iter(), &buf.end_iter(), false).to_string();
+
+            let updated = AgentProfile {
+                id: agent_id.clone(),
+                name,
+                account_id,
+                model,
+                shell_tool_enabled,
+                system_prompt,
+            };
+            {
+                let mut guard = settings.borrow_mut();
+                guard.update_agent(updated);
+                let _ = guard.save();
+            }
+            refresh_agents_list();
+            on_changed();
+        }
+    ));
+
+    form.name_row.connect_changed({
+        let save_edits = Rc::clone(&save_edits);
+        move |_| save_edits()
+    });
+    form.provider_row.connect_selected_notify({
+        let save_edits = Rc::clone(&save_edits);
+        move |_| save_edits()
+    });
+    form.model_row.connect_selected_notify({
+        let save_edits = Rc::clone(&save_edits);
+        let suppress = Rc::clone(&form.suppress_model_events);
+        move |_| {
+            if !suppress.get() {
+                save_edits();
+            }
+        }
+    });
+    form.shell_switch.connect_active_notify({
+        let save_edits = Rc::clone(&save_edits);
+        move |_| save_edits()
+    });
+    form.prompt_view.buffer().connect_changed({
+        let save_edits = Rc::clone(&save_edits);
+        move |_| save_edits()
+    });
+
+    let remove_button = gtk::Button::builder()
+        .label("Remove Agent")
+        .halign(gtk::Align::Center)
+        .margin_top(12)
+        .build();
+    remove_button.add_css_class("destructive-action");
+    remove_button.add_css_class("pill");
+
+    remove_button.connect_clicked(glib::clone!(
+        #[weak]
+        nav_view,
+        #[strong]
+        settings,
+        #[strong]
+        agent_id,
+        #[strong]
+        refresh_agents_list,
+        #[strong]
+        on_changed,
+        move |_| {
+            {
+                let mut guard = settings.borrow_mut();
+                guard.remove_agent(&agent_id);
+                let _ = guard.save();
+            }
+            refresh_agents_list();
+            on_changed();
+            nav_view.pop();
+        }
+    ));
+
+    let danger_group = adw::PreferencesGroup::new();
+    danger_group.add(&remove_button);
+
+    let page_content = adw::PreferencesPage::new();
+    page_content.add(&form.group);
+    page_content.add(&danger_group);
+
+    let header_bar = adw::HeaderBar::new();
+    let toolbar_view = adw::ToolbarView::new();
+    toolbar_view.add_top_bar(&header_bar);
+    toolbar_view.set_content(Some(&page_content));
+
+    let nav_page = adw::NavigationPage::builder()
+        .title(&agent.name)
+        .child(&toolbar_view)
+        .build();
+
+    nav_view.push(&nav_page);
 }
 
 fn api_key_label(kind: ProviderKind) -> &'static str {
